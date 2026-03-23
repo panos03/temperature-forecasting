@@ -404,32 +404,178 @@ def create_dataloaders(train_data, val_data, test_data, batch_size=BATCH_SIZE):
 # SECTION 5: MODEL
 # =============================================================================
 
-# TODO: Define your probabilistic model here.
-#
-# The model should:
-#   - Take input of shape (batch, INPUT_DAYS, NUM_FEATURES)
-#   - Output distribution parameters of shape (batch, TARGET_DAYS, NUM_FEATURES, 2)
-#     where the last dimension is (mu, sigma) for a Gaussian output
-#   - Use an LSTM or Transformer encoder + a probabilistic prediction head
-#
-# Example skeleton:
-#
-# class ProbabilisticForecaster(torch.nn.Module):
-#     def __init__(self, num_features, hidden_size, num_layers, target_days):
-#         super().__init__()
-#         self.encoder = torch.nn.LSTM(num_features, hidden_size, num_layers, batch_first=True)
-#         self.mu_head = torch.nn.Linear(hidden_size, target_days * num_features)
-#         self.sigma_head = torch.nn.Linear(hidden_size, target_days * num_features)
-#         self.target_days = target_days
-#         self.num_features = num_features
-#
-#     def forward(self, x):
-#         _, (h, _) = self.encoder(x)
-#         h = h[-1]  # last layer hidden state
-#         mu = self.mu_head(h).view(-1, self.target_days, self.num_features)
-#         sigma = torch.nn.functional.softplus(self.sigma_head(h)).view(-1, self.target_days, self.num_features)
-#         return mu, sigma
+TARGET_FEATURE_INDICES = [
+    FEATURE_COLUMNS.index("temperature_mean_c"),
+    FEATURE_COLUMNS.index("relative_humidity_mean_pct"),
+    FEATURE_COLUMNS.index("total_precipitation_mm"),
+    FEATURE_COLUMNS.index("wind_speed_mean_ms"),
+]
+NUM_TARGET_FEATURES = len(TARGET_FEATURE_INDICES)  # 4
+# Output head: (mu, log_sigma) per target variable per timestep
+DECODER_OUTPUT_SIZE = NUM_TARGET_FEATURES * 2      # 8
 
+
+class Encoder(torch.nn.Module):
+    """
+    Multi-layer LSTM encoder.
+
+    Reads the full 30-day input sequence (all 9 features) and compresses
+    it into a fixed-size context vector via the final hidden state.
+
+    Args:
+        num_features:  Number of input features (9)
+        hidden_size:   LSTM hidden dimension
+        num_layers:    Number of stacked LSTM layers
+        dropout:       Dropout between LSTM layers (0 if num_layers == 1)
+    """
+    def __init__(self, num_features, hidden_size, num_layers, dropout=0.2):
+        super().__init__()
+        self.lstm = torch.nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, INPUT_DAYS, num_features)
+        Returns:
+            h: (num_layers, batch, hidden_size) — hidden state for decoder init
+            c: (num_layers, batch, hidden_size) — cell state for decoder init
+        """
+        _, (h, c) = self.lstm(x)
+        return h, c
+
+
+class Decoder(torch.nn.Module):
+    """
+    Multi-layer LSTM decoder with learned step embeddings.
+
+    Rather than feeding predictions back in autoregressively (which can cause
+    compounding errors during training), each decoder step is seeded with a
+    learned positional embedding — one per forecast horizon step (7 total).
+    The encoder hidden/cell states are used to initialise the decoder LSTM,
+    so the context from the input window is fully preserved.
+
+    At each step, a linear head maps the LSTM output to:
+        (mu_1, log_sigma_1, mu_2, log_sigma_2, ...) for the 4 target variables
+    sigma is recovered as exp(log_sigma), which is always positive and avoids
+    the saturation issues of softplus near zero.
+
+    Args:
+        hidden_size:   Must match encoder hidden_size
+        num_layers:    Must match encoder num_layers
+        target_days:   Forecast horizon (7)
+        num_targets:   Number of predicted variables (4)
+        dropout:       Dropout between LSTM layers
+    """
+    def __init__(self, hidden_size, num_layers, target_days, num_targets, dropout=0.2):
+        super().__init__()
+        self.target_days = target_days
+        self.num_targets = num_targets
+
+        # One learned vector per forecast step — replaces autoregressive input
+        # Shape: (target_days, hidden_size) so each step gets a full-width seed
+        self.step_embeddings = torch.nn.Embedding(target_days, hidden_size)
+
+        self.lstm = torch.nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Single linear head: hidden -> (mu, log_sigma) for each target variable
+        self.output_head = torch.nn.Linear(hidden_size, num_targets * 2)
+
+    def forward(self, h, c):
+        """
+        Args:
+            h: (num_layers, batch, hidden_size) from encoder
+            c: (num_layers, batch, hidden_size) from encoder
+        Returns:
+            mu:    (batch, target_days, num_targets)
+            sigma: (batch, target_days, num_targets) — always positive via exp
+        """
+        batch_size = h.shape[1]
+
+        # Build step embedding sequence: (batch, target_days, hidden_size)
+        step_ids = torch.arange(self.target_days, device=h.device)          # (target_days,)
+        step_emb = self.step_embeddings(step_ids)                            # (target_days, hidden_size)
+        step_emb = step_emb.unsqueeze(0).expand(batch_size, -1, -1)         # (batch, target_days, hidden_size)
+
+        # Run decoder LSTM over all 7 steps in one pass (teacher-forcing equivalent)
+        out, _ = self.lstm(step_emb, (h, c))                                 # (batch, target_days, hidden_size)
+
+        # Project each step's hidden state to (mu, log_sigma) pairs
+        projected = self.output_head(out)                                    # (batch, target_days, num_targets*2)
+        projected = projected.view(batch_size, self.target_days, self.num_targets, 2)
+
+        mu = projected[..., 0]                                               # (batch, target_days, num_targets)
+        log_sigma = projected[..., 1]
+        # Clamp log_sigma for numerical stability — prevents sigma collapsing
+        # to ~0 or exploding to inf in early training
+        log_sigma = torch.clamp(log_sigma, min=-6.0, max=2.0)
+        sigma = torch.exp(log_sigma)                                         # always positive
+
+        return mu, sigma
+
+
+class ProbabilisticForecaster(torch.nn.Module):
+    """
+    Full encoder-decoder model for probabilistic multi-step weather forecasting.
+
+    Architecture summary:
+        Encoder LSTM  (9 features in  -> hidden_size)
+              |
+        hidden state h, cell state c
+              |
+        Decoder LSTM  (learned step embeddings -> hidden_size)
+              |
+        Linear head   (hidden_size -> 4 * 2)
+              |
+        mu, sigma     (batch, 7, 4)
+
+    Designed for a T4 GPU on Google Colab:
+        hidden_size=256, num_layers=2 -> ~2.5M parameters, fits comfortably
+        in 16 GB VRAM with batch_size=64 and sequence length 30+7.
+
+    Args:
+        num_features:  Total encoder input features (9)
+        hidden_size:   LSTM hidden dimension (default 256)
+        num_layers:    Stacked LSTM layers in both encoder and decoder (default 2)
+        target_days:   Forecast horizon (default 7)
+        num_targets:   Variables to predict probabilistically (default 4)
+        dropout:       Regularisation dropout between LSTM layers (default 0.2)
+    """
+    def __init__(
+        self,
+        num_features=NUM_FEATURES,
+        hidden_size=256,
+        num_layers=2,
+        target_days=TARGET_DAYS,
+        num_targets=NUM_TARGET_FEATURES,
+        dropout=0.2,
+    ):
+        super().__init__()
+        self.encoder = Encoder(num_features, hidden_size, num_layers, dropout)
+        self.decoder = Decoder(hidden_size, num_layers, target_days, num_targets, dropout)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, INPUT_DAYS, NUM_FEATURES) — normalised input window
+        Returns:
+            mu:    (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+            sigma: (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+        """
+        h, c = self.encoder(x)
+        mu, sigma = self.decoder(h, c)
+        return mu, sigma
 
 # =============================================================================
 # SECTION 6: TRAINING LOOP
