@@ -84,6 +84,17 @@ DAILY_COLUMNS = [
 FEATURE_COLUMNS = DAILY_COLUMNS[1:]
 NUM_FEATURES = len(FEATURE_COLUMNS)
 
+# The 4 variables the model predicts probabilistically
+TARGET_FEATURE_INDICES = [
+    FEATURE_COLUMNS.index("temperature_mean_c"),
+    FEATURE_COLUMNS.index("relative_humidity_mean_pct"),
+    FEATURE_COLUMNS.index("total_precipitation_mm"),
+    FEATURE_COLUMNS.index("wind_speed_mean_ms"),
+]
+NUM_TARGET_FEATURES = len(TARGET_FEATURE_INDICES)  # 4
+# Output head: (mu, log_sigma) per target variable per timestep
+DECODER_OUTPUT_SIZE = NUM_TARGET_FEATURES * 2      # 8
+
 
 # =============================================================================
 # SECTION 1: DATA DOWNLOAD
@@ -372,8 +383,10 @@ class WeatherWindowDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        x = self.data[idx: idx + self.input_days]                             # (INPUT_DAYS, NUM_FEATURES)
-        y = self.data[idx + self.input_days: idx + self.total_window]          # (TARGET_DAYS, NUM_FEATURES)
+        x = self.data[idx: idx + self.input_days]                                      # (INPUT_DAYS, NUM_FEATURES)
+        y_full = self.data[idx + self.input_days: idx + self.total_window]             # (TARGET_DAYS, NUM_FEATURES)
+        # Extract only the 4 target variables from the full 9-feature target
+        y = y_full[:, TARGET_FEATURE_INDICES]                                          # (TARGET_DAYS, NUM_TARGET_FEATURES)
         return x, y
 
 
@@ -403,17 +416,6 @@ def create_dataloaders(train_data, val_data, test_data, batch_size=BATCH_SIZE):
 # =============================================================================
 # SECTION 5: MODEL
 # =============================================================================
-
-TARGET_FEATURE_INDICES = [
-    FEATURE_COLUMNS.index("temperature_mean_c"),
-    FEATURE_COLUMNS.index("relative_humidity_mean_pct"),
-    FEATURE_COLUMNS.index("total_precipitation_mm"),
-    FEATURE_COLUMNS.index("wind_speed_mean_ms"),
-]
-NUM_TARGET_FEATURES = len(TARGET_FEATURE_INDICES)  # 4
-# Output head: (mu, log_sigma) per target variable per timestep
-DECODER_OUTPUT_SIZE = NUM_TARGET_FEATURES * 2      # 8
-
 
 class Encoder(torch.nn.Module):
     """
@@ -625,15 +627,12 @@ def train_one_epoch(model, loader, optimiser, device):
         x = x.to(device)
         y = y.to(device)
 
-        # Extract only the 4 target variables from the full 9-feature target
-        y_targets = y[:, :, TARGET_FEATURE_INDICES]   # (batch, TARGET_DAYS, 4)
-
         optimiser.zero_grad()
         mu, sigma = model(x)
-        loss = gaussian_nll_loss(mu, sigma, y_targets)
+        loss = gaussian_nll_loss(mu, sigma, y)
         loss.backward()
 
-        # Gradient clipping — prevents exploding gradients in deep LSTMs
+        # Gradient clipping - prevents exploding gradients in deep LSTMs
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         optimiser.step()
@@ -664,9 +663,8 @@ def validate(model, loader, device):
             x = x.to(device)
             y = y.to(device)
 
-            y_targets = y[:, :, TARGET_FEATURE_INDICES]
             mu, sigma = model(x)
-            loss = gaussian_nll_loss(mu, sigma, y_targets)
+            loss = gaussian_nll_loss(mu, sigma, y)
             total_loss += loss.item()
 
     return total_loss / len(loader)
@@ -694,7 +692,7 @@ def train(model, train_loader, val_loader, device, weights_path):
     PATIENCE = 10
 
     optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    # Reduce LR by 0.5 when val loss plateaus for 5 epochs
+    # Reduce learning rate by 0.5 when val loss plateaus for 5 epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="min", factor=0.5, patience=5
     )
@@ -717,6 +715,7 @@ def train(model, train_loader, val_loader, device, weights_path):
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
 
+        # Early stopping check
         improved = val_loss < best_val_loss
         if improved:
             best_val_loss = val_loss
@@ -785,7 +784,7 @@ def main():
     # Verify shapes
     x_batch, y_batch = next(iter(train_loader))
     print(f"\n[VERIFY] Input batch shape:  {x_batch.shape}")   # (batch, 30, 9)
-    print(f"[VERIFY] Target batch shape: {y_batch.shape}")      # (batch, 7, 9)
+    print(f"[VERIFY] Target batch shape: {y_batch.shape}")      # (batch, 7, 4)
 
     # --- Step 5: Create model ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -799,6 +798,7 @@ def main():
     # --- Step 6: Train ---
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
     weights_path = os.path.join(WEIGHTS_DIR, "best_model.pt")
+    # NOTE: weights are saved every epoch when validation improves, inside train()
     history = train(model, train_loader, val_loader, device, weights_path)
     history_path = os.path.join(WEIGHTS_DIR, "loss_history.pt")
     torch.save(history, history_path)
@@ -810,7 +810,7 @@ def main():
     test_nll = validate(model, test_loader, device)
     print(f"[EVAL] Test NLL: {test_nll:.4f}")
 
-    # --- Step 8: Save normalisation stats alongside weights ---
+    # --- Step 8: Save normalisation stats ---
     stats_path = os.path.join(WEIGHTS_DIR, "normalisation_stats.pt")
     torch.save({"mean": train_mean, "std": train_std}, stats_path)
     print(f"[EVAL] Normalisation stats saved to {stats_path}")
