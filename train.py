@@ -84,6 +84,17 @@ DAILY_COLUMNS = [
 FEATURE_COLUMNS = DAILY_COLUMNS[1:]
 NUM_FEATURES = len(FEATURE_COLUMNS)
 
+# The 4 variables the model predicts probabilistically
+TARGET_FEATURE_INDICES = [
+    FEATURE_COLUMNS.index("temperature_mean_c"),
+    FEATURE_COLUMNS.index("relative_humidity_mean_pct"),
+    FEATURE_COLUMNS.index("total_precipitation_mm"),
+    FEATURE_COLUMNS.index("wind_speed_mean_ms"),
+]
+NUM_TARGET_FEATURES = len(TARGET_FEATURE_INDICES)  # 4
+# Output head: (mu, log_sigma) per target variable per timestep
+DECODER_OUTPUT_SIZE = NUM_TARGET_FEATURES * 2      # 8
+
 
 # =============================================================================
 # SECTION 1: DATA DOWNLOAD
@@ -372,8 +383,10 @@ class WeatherWindowDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        x = self.data[idx: idx + self.input_days]                             # (INPUT_DAYS, NUM_FEATURES)
-        y = self.data[idx + self.input_days: idx + self.total_window]          # (TARGET_DAYS, NUM_FEATURES)
+        x = self.data[idx: idx + self.input_days]                                      # (INPUT_DAYS, NUM_FEATURES)
+        y_full = self.data[idx + self.input_days: idx + self.total_window]             # (TARGET_DAYS, NUM_FEATURES)
+        # Extract only the 4 target variables from the full 9-feature target
+        y = y_full[:, TARGET_FEATURE_INDICES]                                          # (TARGET_DAYS, NUM_TARGET_FEATURES)
         return x, y
 
 
@@ -403,17 +416,6 @@ def create_dataloaders(train_data, val_data, test_data, batch_size=BATCH_SIZE):
 # =============================================================================
 # SECTION 5: MODEL
 # =============================================================================
-
-TARGET_FEATURE_INDICES = [
-    FEATURE_COLUMNS.index("temperature_mean_c"),
-    FEATURE_COLUMNS.index("relative_humidity_mean_pct"),
-    FEATURE_COLUMNS.index("total_precipitation_mm"),
-    FEATURE_COLUMNS.index("wind_speed_mean_ms"),
-]
-NUM_TARGET_FEATURES = len(TARGET_FEATURE_INDICES)  # 4
-# Output head: (mu, log_sigma) per target variable per timestep
-DECODER_OUTPUT_SIZE = NUM_TARGET_FEATURES * 2      # 8
-
 
 class Encoder(torch.nn.Module):
     """
@@ -578,29 +580,166 @@ class ProbabilisticForecaster(torch.nn.Module):
         return mu, sigma
 
 # =============================================================================
-# SECTION 6: TRAINING LOOP
+# SECTION 6: LOSS FUNCTION AND TRAINING LOOP
 # =============================================================================
 
-# TODO: Implement training loop here.
-#
-# Key points:
-#   - Loss: Negative log-likelihood (NLL) of the true values under the
-#     predicted Gaussian distribution:
-#       NLL = 0.5 * (log(sigma^2) + (y - mu)^2 / sigma^2)
-#   - Optimiser: Adam with learning rate 1e-3
-#   - Track training and validation loss per epoch
-#   - Save best model weights based on validation loss
-#
-# def gaussian_nll_loss(mu, sigma, target):
-#     """Negative log-likelihood for a Gaussian distribution."""
-#     variance = sigma ** 2
-#     return 0.5 * torch.mean(torch.log(variance) + (target - mu) ** 2 / variance)
-#
-# def train_one_epoch(model, loader, optimiser):
-#     ...
-#
-# def validate(model, loader):
-#     ...
+def gaussian_nll_loss(mu, sigma, target):
+    """
+    Gaussian negative log-likelihood, averaged over all elements.
+
+    For each predicted (mu, sigma) and true value y:
+        NLL = 0.5 * (log(sigma^2) + (y - mu)^2 / sigma^2)
+            = log(sigma) + 0.5 * ((y - mu) / sigma)^2  + const
+
+    Summed across all 4 target variables and 7 forecast steps, then
+    averaged over the batch. The constant 0.5*log(2*pi) is omitted —
+    it does not affect optimisation.
+
+    Args:
+        mu:     (batch, TARGET_DAYS, NUM_TARGET_FEATURES) — predicted means
+        sigma:  (batch, TARGET_DAYS, NUM_TARGET_FEATURES) — predicted std devs (> 0)
+        target: (batch, TARGET_DAYS, NUM_TARGET_FEATURES) — ground truth values
+
+    Returns:
+        Scalar loss value.
+    """
+    variance = sigma ** 2
+    return 0.5 * torch.mean(torch.log(variance) + (target - mu) ** 2 / variance)
+
+
+def train_one_epoch(model, loader, optimiser, device):
+    """
+    Run one full pass over the training set.
+
+    Args:
+        model:     ProbabilisticForecaster
+        loader:    training DataLoader
+        optimiser: Adam optimiser
+        device:    torch.device
+
+    Returns:
+        Mean NLL loss over all batches.
+    """
+    model.train()
+    total_loss = 0.0
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        optimiser.zero_grad()
+        mu, sigma = model(x)
+        loss = gaussian_nll_loss(mu, sigma, y)
+        loss.backward()
+
+        # Gradient clipping - prevents exploding gradients in deep LSTMs
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimiser.step()
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def validate(model, loader, device):
+    """
+    Evaluate the model on a validation or test DataLoader.
+
+    No gradients are computed. Returns mean NLL loss.
+
+    Args:
+        model:  ProbabilisticForecaster
+        loader: DataLoader (val or test)
+        device: torch.device
+
+    Returns:
+        Mean NLL loss over all batches.
+    """
+    model.eval()
+    total_loss = 0.0
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            mu, sigma = model(x)
+            loss = gaussian_nll_loss(mu, sigma, y)
+            total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def train(model, train_loader, val_loader, device, weights_path):
+    """
+    Full training loop with early stopping on validation NLL.
+
+    Trains for up to EPOCHS epochs. After each epoch, evaluates on the
+    validation set. Saves the best model weights whenever validation loss
+    improves. Stops early if validation loss has not improved for
+    PATIENCE consecutive epochs.
+
+    Args:
+        model:        ProbabilisticForecaster
+        train_loader: training DataLoader
+        val_loader:   validation DataLoader
+        device:       torch.device
+        weights_path: path to save best model .pt file
+
+    Returns:
+        history: dict with keys "train_loss" and "val_loss" (lists of floats)
+    """
+    PATIENCE = 10
+
+    optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # Reduce learning rate by 0.5 when val loss plateaus for 5 epochs
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimiser, mode="min", factor=0.5, patience=5
+    )
+
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    history = {"train_loss": [], "val_loss": []}
+
+    print(f"\n[TRAIN] Starting training for up to {EPOCHS} epochs "
+          f"(early stopping patience={PATIENCE})")
+    print(f"[TRAIN] Device: {device}")
+    print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
+
+    for epoch in range(1, EPOCHS + 1):
+        train_loss = train_one_epoch(model, train_loader, optimiser, device)
+        val_loss = validate(model, val_loader, device)
+
+        scheduler.step(val_loss)
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        # Early stopping check
+        improved = val_loss < best_val_loss
+        if improved:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), weights_path)
+            marker = " *"
+        else:
+            epochs_without_improvement += 1
+            marker = ""
+
+        print(
+            f"Epoch {epoch:03d}/{EPOCHS} | "
+            f"Train NLL: {train_loss:.4f} | "
+            f"Val NLL: {val_loss:.4f}"
+            f"{marker}"
+        )
+
+        if epochs_without_improvement >= PATIENCE:
+            print(f"\n[TRAIN] Early stopping at epoch {epoch} "
+                  f"(no improvement for {PATIENCE} epochs)")
+            break
+
+    print(f"\n[TRAIN] Done. Best val NLL: {best_val_loss:.4f} — weights saved to {weights_path}")
+    return history
 
 
 # =============================================================================
@@ -645,20 +784,36 @@ def main():
     # Verify shapes
     x_batch, y_batch = next(iter(train_loader))
     print(f"\n[VERIFY] Input batch shape:  {x_batch.shape}")   # (batch, 30, 9)
-    print(f"[VERIFY] Target batch shape: {y_batch.shape}")      # (batch, 7, 9)
+    print(f"[VERIFY] Target batch shape: {y_batch.shape}")      # (batch, 7, 4)
 
     # --- Step 5: Create model ---
-    # TODO: model = ProbabilisticForecaster(...)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ProbabilisticForecaster()
+    model.to(device)
+
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n[MODEL] ProbabilisticForecaster — {num_params:,} trainable parameters")
+    print(f"[MODEL] Device: {device}")
 
     # --- Step 6: Train ---
-    # TODO: training loop
-
-    # --- Step 7: Evaluate ---
-    # TODO: evaluation on test set
-
-    # --- Step 8: Save weights ---
     os.makedirs(WEIGHTS_DIR, exist_ok=True)
-    # TODO: torch.save(model.state_dict(), os.path.join(WEIGHTS_DIR, "best_model.pt"))
+    weights_path = os.path.join(WEIGHTS_DIR, "best_model.pt")
+    # NOTE: weights are saved every epoch when validation improves, inside train()
+    history = train(model, train_loader, val_loader, device, weights_path)
+    history_path = os.path.join(WEIGHTS_DIR, "loss_history.pt")
+    torch.save(history, history_path)
+    print(f"[TRAIN] Loss history saved to {history_path}")
+
+    # --- Step 7: Evaluate on test set ---
+    print("\n[EVAL] Loading best weights for test evaluation...")
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    test_nll = validate(model, test_loader, device)
+    print(f"[EVAL] Test NLL: {test_nll:.4f}")
+
+    # --- Step 8: Save normalisation stats ---
+    stats_path = os.path.join(WEIGHTS_DIR, "normalisation_stats.pt")
+    torch.save({"mean": train_mean, "std": train_std}, stats_path)
+    print(f"[EVAL] Normalisation stats saved to {stats_path}")
 
     print("\n[DONE]")
 
