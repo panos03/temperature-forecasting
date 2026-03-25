@@ -11,7 +11,18 @@ Supports model outputs of shape (B, H, V) for means and std, where:
 
 import torch
 import numpy as np
+import os
 from PIL import Image, ImageDraw, ImageFont
+from torch.utils.data import DataLoader
+
+from train import (
+    load_daily_data,
+    ProbabilisticForecaster,
+    WeatherWindowDataset,
+    FEATURE_COLUMNS,
+    TARGET_FEATURE_INDICES,
+    MODELS_DIR,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -329,13 +340,20 @@ def plot_calibration(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
 
 
 def plot_forecast(mu: np.ndarray, sigma: np.ndarray, y: np.ndarray,
-                  var_names: list, sample_idx: int = 0,
+                  var_names: list,
                   save_path: str = 'forecast.png'):
     """
-    Saves predicted mean ± 1std / ± 2std bands against ground truth as a PNG. 
+    Saves predicted mean ± 1std / ± 2std bands against ground truth as a PNG.
     One subplot row per forecast variable.
+
+    Args:
+        mu:        (H, V) predicted means in real-world units
+        sigma:     (H, V) predicted std devs in real-world units
+        y:         (H, V) ground truth in real-world units
+        var_names: list of variable name strings
+        save_path: output file path
     """
-    H_steps = mu.shape[1]
+    H_steps = mu.shape[0]
     V       = len(var_names)
 
     # layout
@@ -361,14 +379,14 @@ def plot_forecast(mu: np.ndarray, sigma: np.ndarray, y: np.ndarray,
               '7-Day Probabilistic Weather Forecast vs Observations',
               fill=C_BLACK, font=font_large)
     draw.text((panel_w // 2 - 195, 34),
-              'Predicted mean  ·  ±1std / ±2std uncertainty bands  ·  Ground truth',
+              'Predicted mean  ·  ±1std / ±2std uncertainty bands  ·  Ground truth  ·  a single test-set window',
               fill=C_MID_GREY, font=font_sm)
 
     # Per variable panels
     for vi in range(V):
-        m     = mu[sample_idx, :, vi]
-        s     = sigma[sample_idx, :, vi]
-        truth = y[sample_idx, :, vi]
+        m     = mu[:, vi]
+        s     = sigma[:, vi]
+        truth = y[:, vi]
 
         y_off = header_h + vi * panel_h   # vertical offset for this panel
 
@@ -521,7 +539,7 @@ def plot_forecast(mu: np.ndarray, sigma: np.ndarray, y: np.ndarray,
 # Summary Table — All Metrics at Once
 # ---------------------------------------------------------------------------
 
-VAR_NAMES = ['temperature', 'rainfall', 'humidity', 'wind_speed']
+VAR_NAMES = [FEATURE_COLUMNS[i] for i in TARGET_FEATURE_INDICES]
 
 def evaluate_all(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
                  var_names: list = None) -> dict:
@@ -544,37 +562,144 @@ def evaluate_all(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Shared: print metrics + save plots
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
-    B, H, V = 32, 7, 4
-    mu_dummy    = torch.randn(B, H, V)
-    sigma_dummy = torch.rand(B, H, V) + 0.1   # ensure > 0
-    y_dummy     = torch.randn(B, H, V)
+RESULTS_DIR = "results"
 
-    results = evaluate_all(mu_dummy, sigma_dummy, y_dummy)
+def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
+                      mu_plot: np.ndarray, sigma_plot: np.ndarray, y_plot: np.ndarray,
+                      var_names: list, label: str):
+    """
+    Print all evaluation metrics and save calibration + forecast PNGs.
 
-    print("=== Smoke Test Results ===")
+    Args:
+        mu, sigma, y:             tensors in normalised space — used for metrics
+        mu_plot, sigma_plot, y_plot: numpy arrays in real-world units — used for plots
+        var_names:                list of variable name strings
+        label:                    short tag used in output filenames, e.g. 'dummy' or 'real'
+    """
+    results = evaluate_all(mu, sigma, y, var_names=var_names)
+    print(f"\n=== Results ({label}) ===")
     print(f"  NLL:  {results['nll']:.4f}")
     print(f"  CRPS: {results['crps']:.4f}")
     print(f"  RMSE: {results['rmse']:.4f}")
     print(f"  MAE:  {results['mae']:.4f}")
-    print(f"  Coverage:")
+    print("  Coverage:")
     for cl, cov in results['coverage'].items():
         print(f"    {int(cl*100):>3}% interval -> {cov*100:.1f}% empirical")
-    print(f"  RMSE per variable:")
+    print("  RMSE per variable:")
     for var, val in results['rmse_per_var'].items():
         print(f"    {var}: {val:.4f}")
 
-    # Calibration plot — saved as PNG via Pillow
-    plot_calibration(mu_dummy, sigma_dummy, y_dummy, save_path='calibration_test.png')
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    plot_calibration(mu, sigma, y,
+                     save_path=os.path.join(RESULTS_DIR, f'calibration_{label}.png'))
+    # Visualise the first test-set window as a single representative example
+    plot_forecast(mu_plot[0], sigma_plot[0], y_plot[0],
+                  var_names=var_names,
+                  save_path=os.path.join(RESULTS_DIR, f'forecast_{label}.png'))
 
-    # Forecast plot — saved as PNG via Pillow
-    plot_forecast(mu_dummy.numpy(), sigma_dummy.numpy(), y_dummy.numpy(),
-                  var_names=VAR_NAMES, sample_idx=0, save_path='forecast_test.png')
 
-    print("\nAll checks passed.")
+# ---------------------------------------------------------------------------
+# Dummy-data smoke test — no real data required
+# ---------------------------------------------------------------------------
+
+def dummy_data_test():
+    """Smoke test using randomly generated tensors."""
+    B, H, V = 32, 7, 4
+    mu    = torch.randn(B, H, V)
+    sigma = torch.rand(B, H, V) + 0.1
+    y     = torch.randn(B, H, V)
+
+    evaluate_and_plot(mu, sigma, y,
+                      mu.numpy(), sigma.numpy(), y.numpy(),
+                      var_names=VAR_NAMES, label='dummy')
+    print("\nDummy data test complete.")
+
+
+# ---------------------------------------------------------------------------
+# Real-data evaluation — loads model saved by train.py, no training here
+# ---------------------------------------------------------------------------
+
+def real_data_test():
+    """
+    Load the model saved by train.py, run inference on the test split, and
+    produce forecast and calibration plots with real predicted values.
+
+    Run train.py first (e.g. main(max_records=500, n_epochs=5)) to generate
+    the required artefacts in the models/ directory.
+    """
+    weights_path = os.path.join(MODELS_DIR, "best_model.pt")
+    stats_path   = os.path.join(MODELS_DIR, "normalisation_stats.pt")
+    config_path  = os.path.join(MODELS_DIR, "split_config.pt")
+
+    for p in (weights_path, stats_path, config_path):
+        if not os.path.exists(p):
+            raise FileNotFoundError(
+                f"{p} not found — run train.py first to generate model artefacts."
+            )
+
+    # ---- Load saved artefacts ----
+    stats       = torch.load(stats_path,  map_location="cpu")
+    config      = torch.load(config_path, map_location="cpu")
+    train_mean  = stats["mean"]
+    train_std   = stats["std"]
+    max_records = config["max_records"]
+    split_fracs = config["split_fracs"]
+
+    # ---- Reconstruct test split using the same config (no retraining) ----
+    dates, features = load_daily_data(max_records=max_records)
+    n = len(features)
+    if split_fracs is not None:
+        n_train = int(n * split_fracs[0])
+        n_val   = int(n * split_fracs[1])
+        test_features = features[n_train + n_val:]
+    else:
+        from train import VAL_END_YEAR
+        test_features = features[[i for i, d in enumerate(dates) if int(d[:4]) > VAL_END_YEAR]]
+
+    test_data    = (test_features - train_mean) / train_std
+    test_dataset = WeatherWindowDataset(test_data)
+    test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+    # ---- Load model ----
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = ProbabilisticForecaster()
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    model.to(device)
+    model.eval()
+    print(f"[EVAL] Loaded model from {weights_path}  (device: {device})")
+
+    # ---- Collect predictions ----
+    all_mu, all_sigma, all_y = [], [], []
+    with torch.no_grad():
+        for x, y in test_loader:
+            mu, sigma = model(x.to(device))
+            all_mu.append(mu.cpu())
+            all_sigma.append(sigma.cpu())
+            all_y.append(y.cpu())
+
+    mu_norm    = torch.cat(all_mu,    dim=0)
+    sigma_norm = torch.cat(all_sigma, dim=0)
+    y_norm     = torch.cat(all_y,     dim=0)
+
+    # ---- Denormalise for interpretable plots ----
+    t_mean     = train_mean[TARGET_FEATURE_INDICES]
+    t_std      = train_std[TARGET_FEATURE_INDICES]
+    mu_real    = (mu_norm    * t_std + t_mean).numpy()
+    sigma_real = (sigma_norm * t_std).numpy()
+    y_real     = (y_norm     * t_std + t_mean).numpy()
+
+    evaluate_and_plot(mu_norm, sigma_norm, y_norm,
+                      mu_real, sigma_real, y_real,
+                      var_names=VAR_NAMES, label='real')
+    print("\nReal data test complete.")
+
+
+if __name__ == '__main__':
+    dummy_data_test()
+    real_data_test()
 
 
 

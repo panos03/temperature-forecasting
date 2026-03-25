@@ -48,7 +48,7 @@ ERA5_VARIABLES = [
 # Paths
 RAW_DIR = "data/raw"
 PROCESSED_DIR = "data/processed"
-WEIGHTS_DIR = "weights"
+MODELS_DIR = "models"
 RAW_CSV = os.path.join(RAW_DIR, "era5_minas_gerais_hourly.csv")
 DAILY_CSV = os.path.join(PROCESSED_DIR, "minas_gerais_daily_weather.csv")
 
@@ -281,9 +281,14 @@ def preprocess_hourly_to_daily():
 # SECTION 3: LOAD, NORMALISE, AND SPLIT
 # =============================================================================
 
-def load_daily_data():
+def load_daily_data(max_records=None):
     """
     Load the daily CSV into a torch tensor and date list.
+
+    Args:
+        max_records: choose to take only first N rows - useful for quick
+                     tests without loading the full 20-year dataset.
+
     Returns:
         dates:    list of date strings ["2004-01-01", ...]
         features: torch.Tensor of shape (num_days, NUM_FEATURES)
@@ -295,6 +300,9 @@ def load_daily_data():
         reader = csv.DictReader(f)
         rows = list(reader)
 
+    if max_records is not None:
+        rows = rows[:max_records]
+
     dates = [r["date"] for r in rows]
     features = torch.tensor(
         [[float(r[col]) for col in FEATURE_COLUMNS] for r in rows],
@@ -305,25 +313,41 @@ def load_daily_data():
     return dates, features
 
 
-def split_and_normalise(dates, features):
+def split_and_normalise(dates, features, split_fracs=None):
     """
     Chronological train/val/test split with z-score normalisation.
 
     Normalisation is fit on the TRAINING set only to prevent data leakage.
     The same mean and std are applied to val and test sets.
 
+    Args:
+        dates:       list of date strings
+        features:    torch.Tensor (num_days, NUM_FEATURES)
+        split_fracs: optional tuple (train_frac, val_frac, test_frac) that
+                     overrides the year-based split with a simple index split.
+                     Use this when max_records is set and the slice doesn't
+                     span multiple calendar years
+
     Returns:
         train_data, val_data, test_data: torch.Tensors (normalised)
         train_mean, train_std: torch.Tensors for inverse transform later
     """
-    # Find split indices based on year
-    train_idx = [i for i, d in enumerate(dates) if int(d[:4]) <= TRAIN_END_YEAR]
-    val_idx = [i for i, d in enumerate(dates) if TRAIN_END_YEAR < int(d[:4]) <= VAL_END_YEAR]
-    test_idx = [i for i, d in enumerate(dates) if int(d[:4]) > VAL_END_YEAR]
+    if split_fracs is not None:
+        n = len(features)
+        n_train = int(n * split_fracs[0])
+        n_val   = int(n * split_fracs[1])
+        train_idx = list(range(0, n_train))
+        val_idx   = list(range(n_train, n_train + n_val))
+        test_idx  = list(range(n_train + n_val, n))
+    else:
+        # Default: year-based chronological split
+        train_idx = [i for i, d in enumerate(dates) if int(d[:4]) <= TRAIN_END_YEAR]
+        val_idx   = [i for i, d in enumerate(dates) if TRAIN_END_YEAR < int(d[:4]) <= VAL_END_YEAR]
+        test_idx  = [i for i, d in enumerate(dates) if int(d[:4]) > VAL_END_YEAR]
 
     train_data = features[train_idx]
-    val_data = features[val_idx]
-    test_data = features[test_idx]
+    val_data   = features[val_idx]
+    test_data  = features[test_idx]
 
     print(f"[SPLIT] Train: {len(train_idx)} days ({dates[train_idx[0]]} to {dates[train_idx[-1]]})")
     print(f"[SPLIT] Val:   {len(val_idx)} days ({dates[val_idx[0]]} to {dates[val_idx[-1]]})")
@@ -592,7 +616,7 @@ class ProbabilisticForecaster(torch.nn.Module):
     ):
         super().__init__()
         self.encoder = Encoder(num_features, hidden_size, num_layers, dropout)
-        self.decoder = Decoder(hidden_size, num_layers, target_days, num_targets, dropout)
+        self.decoder = Decoder(hidden_size, num_layers, target_days, num_targets, dropout=dropout)
 
     def forward(self, x, targets=None, teacher_forcing_ratio=0.5):
         """
@@ -684,11 +708,11 @@ def validate(model, loader, device):
     return total_loss / len(loader)
 
 
-def train(model, train_loader, val_loader, device, weights_path):
+def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS):
     """
     Full training loop with early stopping on validation NLL.
 
-    Trains for up to EPOCHS epochs. After each epoch, evaluates on the
+    Trains for up to n_epochs epochs. After each epoch, evaluates on the
     validation set. Saves the best model weights whenever validation loss
     improves. Stops early if validation loss has not improved for
     PATIENCE consecutive epochs.
@@ -699,6 +723,7 @@ def train(model, train_loader, val_loader, device, weights_path):
         val_loader:   validation DataLoader
         device:       torch.device
         weights_path: path to save best model .pt file
+        n_epochs:     maximum number of training epochs (default: EPOCHS)
 
     Returns:
         history: dict with keys "train_loss" and "val_loss" (lists of floats)
@@ -715,12 +740,12 @@ def train(model, train_loader, val_loader, device, weights_path):
     epochs_without_improvement = 0
     history = {"train_loss": [], "val_loss": []}
 
-    print(f"\n[TRAIN] Starting training for up to {EPOCHS} epochs "
+    print(f"\n[TRAIN] Starting training for up to {n_epochs} epochs "
           f"(early stopping patience={PATIENCE})")
     print(f"[TRAIN] Device: {device}")
     print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, n_epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimiser, device)
         val_loss = validate(model, val_loader, device)
 
@@ -741,7 +766,7 @@ def train(model, train_loader, val_loader, device, weights_path):
             marker = ""
 
         print(
-            f"Epoch {epoch:03d}/{EPOCHS} | "
+            f"Epoch {epoch:03d}/{n_epochs} | "
             f"Train NLL: {train_loss:.4f} | "
             f"Val NLL: {val_loss:.4f}"
             f"{marker}"
@@ -777,7 +802,17 @@ def train(model, train_loader, val_loader, device, weights_path):
 # SECTION 8: MAIN
 # =============================================================================
 
-def main():
+def main(max_records=None, n_epochs=EPOCHS):
+    """
+    Full training pipeline.
+
+    Args:
+        max_records: if set, use only the first N days — useful for a quick
+                     smoke test before running on the full dataset.
+                     Switches the train/val/test split to a 70/15/15 fraction
+                     split instead of the calendar-year split.
+        n_epochs:    maximum training epochs (default: EPOCHS constant)
+    """
     print("=" * 70)
     print("Probabilistic Weather Forecasting - Minas Gerais Coffee Belt")
     print("=" * 70)
@@ -789,8 +824,13 @@ def main():
     preprocess_hourly_to_daily()
 
     # --- Step 3: Load, split, normalise ---
-    dates, features = load_daily_data()
-    train_data, val_data, test_data, train_mean, train_std = split_and_normalise(dates, features)
+    dates, features = load_daily_data(max_records=max_records)
+    # Use fraction-based split when a record limit is set — the slice won't
+    # span the 2019/2021 year boundaries used by the default calendar split.
+    split_fracs = (0.70, 0.15, 0.15) if max_records is not None else None
+    train_data, val_data, test_data, train_mean, train_std = split_and_normalise(
+        dates, features, split_fracs=split_fracs
+    )
 
     # --- Step 4: Create DataLoaders ---
     train_loader, val_loader, test_loader = create_dataloaders(train_data, val_data, test_data)
@@ -810,11 +850,12 @@ def main():
     print(f"[MODEL] Device: {device}")
 
     # --- Step 6: Train ---
-    os.makedirs(WEIGHTS_DIR, exist_ok=True)
-    weights_path = os.path.join(WEIGHTS_DIR, "best_model.pt")
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    weights_path = os.path.join(MODELS_DIR, "best_model.pt")
     # NOTE: weights are saved every epoch when validation improves, inside train()
-    history = train(model, train_loader, val_loader, device, weights_path)
-    history_path = os.path.join(WEIGHTS_DIR, "loss_history.pt")
+    history = train(model, train_loader, val_loader, device, weights_path,
+                    n_epochs=n_epochs)
+    history_path = os.path.join(MODELS_DIR, "loss_history.pt")
     torch.save(history, history_path)
     print(f"[TRAIN] Loss history saved to {history_path}")
 
@@ -824,13 +865,19 @@ def main():
     test_nll = validate(model, test_loader, device)
     print(f"[EVAL] Test NLL: {test_nll:.4f}")
 
-    # --- Step 8: Save normalisation stats ---
-    stats_path = os.path.join(WEIGHTS_DIR, "normalisation_stats.pt")
+    # --- Step 8: Save normalisation stats and split config ---
+    stats_path = os.path.join(MODELS_DIR, "normalisation_stats.pt")
     torch.save({"mean": train_mean, "std": train_std}, stats_path)
     print(f"[EVAL] Normalisation stats saved to {stats_path}")
+
+    # split_config lets task.py reconstruct the exact same test split
+    config_path = os.path.join(MODELS_DIR, "split_config.pt")
+    torch.save({"max_records": max_records, "split_fracs": split_fracs}, config_path)
+    print(f"[EVAL] Split config saved to {config_path}")
 
     print("\n[DONE]")
 
 
 if __name__ == "__main__":
-    main()
+    # For a quick subset test use: main(max_records=500, n_epochs=20)
+    main(max_records=2000, n_epochs=30)
