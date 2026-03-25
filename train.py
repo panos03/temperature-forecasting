@@ -454,34 +454,37 @@ class Encoder(torch.nn.Module):
 
 class Decoder(torch.nn.Module):
     """
-    Multi-layer LSTM decoder with learned step embeddings.
+    Autoregressive LSTM decoder.
 
-    Rather than feeding predictions back in autoregressively (which can cause
-    compounding errors during training), each decoder step is seeded with a
-    learned positional embedding — one per forecast horizon step (7 total).
-    The encoder hidden/cell states are used to initialise the decoder LSTM,
-    so the context from the input window is fully preserved.
+    At each step, the LSTM input is the previous step's predicted mu values
+    (or during training, the ground truth values — teacher forcing).
 
-    At each step, a linear head maps the LSTM output to:
-        (mu_1, log_sigma_1, mu_2, log_sigma_2, ...) for the 4 target variables
-    sigma is recovered as exp(log_sigma), which is always positive and avoids
-    the saturation issues of softplus near zero.
+    Step 0 is seeded with a learned start embedding since there is no
+    previous prediction at the first step.
 
     Args:
-        hidden_size:   Must match encoder hidden_size
-        num_layers:    Must match encoder num_layers
-        target_days:   Forecast horizon (7)
-        num_targets:   Number of predicted variables (4)
-        dropout:       Dropout between LSTM layers
+        hidden_size:        Must match encoder hidden_size
+        num_layers:         Must match encoder num_layers
+        target_days:        Forecast horizon (7)
+        num_targets:        Number of predicted variables (4)
+        num_input_features: Full feature size for teacher forcing input (4)
+        dropout:            Dropout between LSTM layers
     """
-    def __init__(self, hidden_size, num_layers, target_days, num_targets, dropout=0.2):
+    def __init__(self, hidden_size, num_layers, target_days, num_targets,
+                 num_input_features=NUM_TARGET_FEATURES, dropout=0.2):
         super().__init__()
         self.target_days = target_days
         self.num_targets = num_targets
 
-        # One learned vector per forecast step — replaces autoregressive input
-        # Shape: (target_days, hidden_size) so each step gets a full-width seed
-        self.step_embeddings = torch.nn.Embedding(target_days, hidden_size)
+        # Learned start token — seeds the first decoder step
+        # (equivalent to the old step_embeddings[0] only)
+        self.start_embedding = torch.nn.Parameter(
+            torch.zeros(1, 1, num_input_features)
+        )
+
+        # Input projection: map num_targets -> hidden_size
+        # because LSTM expects input_size == hidden_size here
+        self.input_proj = torch.nn.Linear(num_input_features, hidden_size)
 
         self.lstm = torch.nn.LSTM(
             input_size=hidden_size,
@@ -491,40 +494,64 @@ class Decoder(torch.nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
 
-        # Single linear head: hidden -> (mu, log_sigma) for each target variable
         self.output_head = torch.nn.Linear(hidden_size, num_targets * 2)
 
-    def forward(self, h, c):
+    def forward(self, h, c, targets=None, teacher_forcing_ratio=0.5):
         """
         Args:
-            h: (num_layers, batch, hidden_size) from encoder
-            c: (num_layers, batch, hidden_size) from encoder
+            h:                    (num_layers, batch, hidden_size) from encoder
+            c:                    (num_layers, batch, hidden_size) from encoder
+            targets:              (batch, target_days, num_targets) ground truth,
+                                  or None at inference time
+            teacher_forcing_ratio: probability of using ground truth as next input
+                                  (1.0 = always use truth, 0.0 = always use prediction)
+
         Returns:
             mu:    (batch, target_days, num_targets)
-            sigma: (batch, target_days, num_targets) — always positive via exp
+            sigma: (batch, target_days, num_targets)
         """
         batch_size = h.shape[1]
 
-        # Build step embedding sequence: (batch, target_days, hidden_size)
-        step_ids = torch.arange(self.target_days, device=h.device)          # (target_days,)
-        step_emb = self.step_embeddings(step_ids)                            # (target_days, hidden_size)
-        step_emb = step_emb.unsqueeze(0).expand(batch_size, -1, -1)         # (batch, target_days, hidden_size)
+        all_mu = []
+        all_sigma = []
 
-        # Run decoder LSTM over all 7 steps in one pass (teacher-forcing equivalent)
-        out, _ = self.lstm(step_emb, (h, c))                                 # (batch, target_days, hidden_size)
+        # Seed the first step with the learned start embedding
+        # Shape: (batch, 1, num_targets)
+        current_input = self.start_embedding.expand(batch_size, 1, -1)
 
-        # Project each step's hidden state to (mu, log_sigma) pairs
-        projected = self.output_head(out)                                    # (batch, target_days, num_targets*2)
-        projected = projected.view(batch_size, self.target_days, self.num_targets, 2)
+        for step in range(self.target_days):
+            # Project input to hidden_size
+            step_input = self.input_proj(current_input)      # (batch, 1, hidden_size)
 
-        mu = projected[..., 0]                                               # (batch, target_days, num_targets)
-        log_sigma = projected[..., 1]
-        # Clamp log_sigma for numerical stability — prevents sigma collapsing
-        # to ~0 or exploding to inf in early training
-        log_sigma = torch.clamp(log_sigma, min=-6.0, max=2.0)
-        sigma = torch.exp(log_sigma)                                         # always positive
+            # One LSTM step — h and c are updated in place each iteration
+            out, (h, c) = self.lstm(step_input, (h, c))     # out: (batch, 1, hidden_size)
 
-        return mu, sigma
+            # Project to (mu, log_sigma)
+            projected = self.output_head(out)                # (batch, 1, num_targets*2)
+            projected = projected.view(batch_size, 1, self.num_targets, 2)
+
+            mu = projected[..., 0].squeeze(1)                # (batch, num_targets)
+            log_sigma = projected[..., 1].squeeze(1)
+            log_sigma = torch.clamp(log_sigma, min=-6.0, max=2.0)
+            sigma = torch.exp(log_sigma)
+
+            all_mu.append(mu)
+            all_sigma.append(sigma)
+
+            # --- Decide next input: teacher forcing or own prediction ---
+            if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                # Use ground truth from this step as next input
+                next_input = targets[:, step, :]             # (batch, num_targets)
+            else:
+                # Use own prediction (detached to avoid gradient through input)
+                next_input = mu.detach()                     # (batch, num_targets)
+
+            current_input = next_input.unsqueeze(1)          # (batch, 1, num_targets)
+
+        mu_all = torch.stack(all_mu, dim=1)                  # (batch, target_days, num_targets)
+        sigma_all = torch.stack(all_sigma, dim=1)
+
+        return mu_all, sigma_all
 
 
 class ProbabilisticForecaster(torch.nn.Module):
@@ -567,16 +594,16 @@ class ProbabilisticForecaster(torch.nn.Module):
         self.encoder = Encoder(num_features, hidden_size, num_layers, dropout)
         self.decoder = Decoder(hidden_size, num_layers, target_days, num_targets, dropout)
 
-    def forward(self, x):
+    def forward(self, x, targets=None, teacher_forcing_ratio=0.5):
         """
         Args:
-            x: (batch, INPUT_DAYS, NUM_FEATURES) — normalised input window
-        Returns:
-            mu:    (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
-            sigma: (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+            x:                    (batch, INPUT_DAYS, NUM_FEATURES)
+            targets:              (batch, TARGET_DAYS, NUM_TARGET_FEATURES) or None
+            teacher_forcing_ratio: passed to decoder (ignored at inference)
         """
         h, c = self.encoder(x)
-        mu, sigma = self.decoder(h, c)
+        mu, sigma = self.decoder(h, c, targets=targets,
+                                teacher_forcing_ratio=teacher_forcing_ratio)
         return mu, sigma
 
 # =============================================================================
@@ -608,18 +635,6 @@ def gaussian_nll_loss(mu, sigma, target):
 
 
 def train_one_epoch(model, loader, optimiser, device):
-    """
-    Run one full pass over the training set.
-
-    Args:
-        model:     ProbabilisticForecaster
-        loader:    training DataLoader
-        optimiser: Adam optimiser
-        device:    torch.device
-
-    Returns:
-        Mean NLL loss over all batches.
-    """
     model.train()
     total_loss = 0.0
 
@@ -628,13 +643,12 @@ def train_one_epoch(model, loader, optimiser, device):
         y = y.to(device)
 
         optimiser.zero_grad()
-        mu, sigma = model(x)
+        # Pass targets for teacher forcing during training
+        mu, sigma = model(x, targets=y, teacher_forcing_ratio=0.5)
         loss = gaussian_nll_loss(mu, sigma, y)
         loss.backward()
 
-        # Gradient clipping - prevents exploding gradients in deep LSTMs
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimiser.step()
         total_loss += loss.item()
 
