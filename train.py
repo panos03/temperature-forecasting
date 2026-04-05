@@ -64,6 +64,7 @@ VAL_END_YEAR = 2021       # Val:   2020-2021
 
 # Training settings
 EPOCHS = 100
+PRETRAIN_EPOCHS = 15    # Phase 1: MSE pretraining epochs before switching to Beta-NLL
 LEARNING_RATE = 3e-4
 
 # Daily CSV column order (output of preprocessing)
@@ -469,11 +470,45 @@ class Encoder(torch.nn.Module):
         Args:
             x: (batch, INPUT_DAYS, num_features)
         Returns:
-            h: (num_layers, batch, hidden_size) — hidden state for decoder init
-            c: (num_layers, batch, hidden_size) — cell state for decoder init
+            outputs: (batch, INPUT_DAYS, hidden_size) — all timestep outputs for attention
+            h:       (num_layers, batch, hidden_size) — hidden state for decoder init
+            c:       (num_layers, batch, hidden_size) — cell state for decoder init
         """
-        _, (h, c) = self.lstm(x)
-        return h, c
+        outputs, (h, c) = self.lstm(x)
+        return outputs, h, c
+
+
+class Attention(torch.nn.Module):
+    """
+    Bahdanau-style additive attention.
+
+    At each decoder step, scores all encoder timesteps and returns a weighted
+    context vector. This lets the decoder focus on the most relevant past days
+    rather than relying solely on the encoder's final hidden state.
+
+    Args:
+        hidden_size: must match encoder and decoder hidden_size
+    """
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = torch.nn.Linear(hidden_size * 2, hidden_size)
+        self.v    = torch.nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(self, query, keys):
+        """
+        Args:
+            query: (batch, hidden_size)          — last-layer decoder hidden state
+            keys:  (batch, seq_len, hidden_size) — encoder outputs
+        Returns:
+            context:      (batch, hidden_size)
+            attn_weights: (batch, seq_len)
+        """
+        seq_len = keys.shape[1]
+        query   = query.unsqueeze(1).expand(-1, seq_len, -1)               # (batch, seq_len, hidden)
+        energy  = torch.tanh(self.attn(torch.cat([query, keys], dim=2)))   # (batch, seq_len, hidden)
+        weights = torch.softmax(self.v(energy).squeeze(2), dim=1)          # (batch, seq_len)
+        context = torch.bmm(weights.unsqueeze(1), keys).squeeze(1)         # (batch, hidden)
+        return context, weights
 
 
 class Decoder(torch.nn.Module):
@@ -518,11 +553,14 @@ class Decoder(torch.nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
 
-        self.output_head = torch.nn.Linear(hidden_size, num_targets * 2)
+        self.attention  = Attention(hidden_size)
+        # Output head takes LSTM output + attention context concatenated
+        self.output_head = torch.nn.Linear(hidden_size * 2, num_targets * 2)
 
-    def forward(self, h, c, targets=None, teacher_forcing_ratio=0.5):
+    def forward(self, encoder_outputs, h, c, targets=None, teacher_forcing_ratio=0.5):
         """
         Args:
+            encoder_outputs:      (batch, INPUT_DAYS, hidden_size) — all encoder timesteps
             h:                    (num_layers, batch, hidden_size) from encoder
             c:                    (num_layers, batch, hidden_size) from encoder
             targets:              (batch, target_days, num_targets) ground truth,
@@ -540,39 +578,44 @@ class Decoder(torch.nn.Module):
         all_sigma = []
 
         # Seed the first step with the learned start embedding
-        # Shape: (batch, 1, num_targets)
-        current_input = self.start_embedding.expand(batch_size, 1, -1)
+        current_input = self.start_embedding.expand(batch_size, 1, -1)   # (batch, 1, num_targets)
 
         for step in range(self.target_days):
             # Project input to hidden_size
-            step_input = self.input_proj(current_input)      # (batch, 1, hidden_size)
+            step_input = self.input_proj(current_input)          # (batch, 1, hidden_size)
 
-            # One LSTM step — h and c are updated in place each iteration
-            out, (h, c) = self.lstm(step_input, (h, c))     # out: (batch, 1, hidden_size)
+            # One LSTM step
+            out, (h, c) = self.lstm(step_input, (h, c))         # out: (batch, 1, hidden_size)
+
+            # Attention: query is last-layer hidden state, keys are encoder outputs
+            query   = h[-1]                                      # (batch, hidden_size)
+            context, _ = self.attention(query, encoder_outputs)  # (batch, hidden_size)
+
+            # Concatenate LSTM output with attention context
+            out_flat = out.squeeze(1)                            # (batch, hidden_size)
+            out_ctx  = torch.cat([out_flat, context], dim=1)    # (batch, hidden_size*2)
 
             # Project to (mu, log_sigma)
-            projected = self.output_head(out)                # (batch, 1, num_targets*2)
-            projected = projected.view(batch_size, 1, self.num_targets, 2)
+            projected = self.output_head(out_ctx)                # (batch, num_targets*2)
+            projected = projected.view(batch_size, self.num_targets, 2)
 
-            mu = projected[..., 0].squeeze(1)                # (batch, num_targets)
-            log_sigma = projected[..., 1].squeeze(1)
+            mu        = projected[..., 0]                        # (batch, num_targets)
+            log_sigma = projected[..., 1]
             log_sigma = torch.clamp(log_sigma, min=-6.0, max=2.0)
-            sigma = torch.exp(log_sigma)
+            sigma     = torch.exp(log_sigma)
 
             all_mu.append(mu)
             all_sigma.append(sigma)
 
             # --- Decide next input: teacher forcing or own prediction ---
             if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                # Use ground truth from this step as next input
-                next_input = targets[:, step, :]             # (batch, num_targets)
+                next_input = targets[:, step, :]                 # (batch, num_targets)
             else:
-                # Use own prediction (detached to avoid gradient through input)
-                next_input = mu.detach()                     # (batch, num_targets)
+                next_input = mu.detach()                         # (batch, num_targets)
 
-            current_input = next_input.unsqueeze(1)          # (batch, 1, num_targets)
+            current_input = next_input.unsqueeze(1)              # (batch, 1, num_targets)
 
-        mu_all = torch.stack(all_mu, dim=1)                  # (batch, target_days, num_targets)
+        mu_all    = torch.stack(all_mu,    dim=1)                # (batch, target_days, num_targets)
         sigma_all = torch.stack(all_sigma, dim=1)
 
         return mu_all, sigma_all
@@ -585,16 +628,17 @@ class ProbabilisticForecaster(torch.nn.Module):
     Architecture summary:
         Encoder LSTM  (9 features in  -> hidden_size)
               |
-        hidden state h, cell state c
+        all outputs + (h, c)
               |
         Decoder LSTM  (learned step embeddings -> hidden_size)
+              + Bahdanau attention over encoder outputs at each step
               |
-        Linear head   (hidden_size -> 4 * 2)
+        Linear head   (hidden_size*2 -> 4 * 2)
               |
         mu, sigma     (batch, 7, 4)
 
     Designed for a T4 GPU on Google Colab:
-        hidden_size=128, num_layers=2 -> ~460k parameters, fits comfortably
+        hidden_size=128, num_layers=2 -> ~530k parameters, fits comfortably
         in 16 GB VRAM with batch_size=64 and sequence length 30+7.
 
     Args:
@@ -625,40 +669,68 @@ class ProbabilisticForecaster(torch.nn.Module):
             targets:              (batch, TARGET_DAYS, NUM_TARGET_FEATURES) or None
             teacher_forcing_ratio: passed to decoder (ignored at inference)
         """
-        h, c = self.encoder(x)
-        mu, sigma = self.decoder(h, c, targets=targets,
-                                teacher_forcing_ratio=teacher_forcing_ratio)
+        encoder_outputs, h, c = self.encoder(x)
+        mu, sigma = self.decoder(encoder_outputs, h, c, targets=targets,
+                                 teacher_forcing_ratio=teacher_forcing_ratio)
         return mu, sigma
 
 # =============================================================================
 # SECTION 6: LOSS FUNCTION AND TRAINING LOOP
 # =============================================================================
 
-def gaussian_nll_loss(mu, sigma, target):
+def mse_loss_mu(mu, target):
     """
-    Gaussian negative log-likelihood, averaged over all elements.
+    MSE on predicted means only.
+    Used in phase-1 pretraining to establish good mu estimates before
+    sigma is introduced, preventing early sigma collapse.
+    """
+    return torch.mean((mu - target) ** 2)
 
-    For each predicted (mu, sigma) and true value y:
-        NLL = 0.5 * (log(sigma^2) + (y - mu)^2 / sigma^2)
-            = log(sigma) + 0.5 * ((y - mu) / sigma)^2  + const
 
-    Summed across all 4 target variables and 7 forecast steps, then
-    averaged over the batch. The constant 0.5*log(2*pi) is omitted —
-    it does not affect optimisation.
+def beta_nll_loss(mu, sigma, target, beta=0.5):
+    """
+    Beta-NLL loss (Seitzer et al. 2022).
+
+    Weights each NLL term by sigma^(2*beta) with a stop-gradient on sigma.
+    This breaks the feedback loop where the model lowers sigma to reduce loss
+    without improving mu — the core cause of sigma collapse.
+
+    beta=0 reduces to plain NLL; beta=1 weights fully by variance.
+    beta=0.5 is the recommended default.
 
     Args:
-        mu:     (batch, TARGET_DAYS, NUM_TARGET_FEATURES) — predicted means
-        sigma:  (batch, TARGET_DAYS, NUM_TARGET_FEATURES) — predicted std devs (> 0)
-        target: (batch, TARGET_DAYS, NUM_TARGET_FEATURES) — ground truth values
-
-    Returns:
-        Scalar loss value.
+        mu:     (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+        sigma:  (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+        target: (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+        beta:   weighting exponent in [0, 1]
     """
     variance = sigma ** 2
-    return 0.5 * torch.mean(torch.log(variance) + (target - mu) ** 2 / variance)
+    weight   = variance.detach() ** beta
+    return 0.5 * (weight * (torch.log(variance) + (target - mu) ** 2 / variance)).mean()
 
 
-def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5):
+def crps_gaussian_loss(mu, sigma, y):
+    """
+    Closed-form CRPS for Gaussian predictive distributions.
+
+    Used as the validation metric for early stopping. CRPS is expressed in
+    the same units as the forecast variables, is robust to sigma scale, and
+    jointly rewards both accuracy and calibration.
+
+    Lower is better.
+    """
+    sigma  = torch.clamp(sigma, min=1e-6)
+    z      = (y - mu) / sigma
+    normal = torch.distributions.Normal(0, 1)
+    phi    = torch.exp(normal.log_prob(z))
+    Phi    = normal.cdf(z)
+    crps   = sigma * (z * (2 * Phi - 1) + 2 * phi - 1.0 / math.sqrt(math.pi))
+    return crps.mean()
+
+
+def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, loss_fn=None):
+    if loss_fn is None:
+        loss_fn = beta_nll_loss
     model.train()
     total_loss = 0.0
 
@@ -668,7 +740,7 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5)
 
         optimiser.zero_grad()
         mu, sigma = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
-        loss = gaussian_nll_loss(mu, sigma, y)
+        loss = loss_fn(mu, sigma, y)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -678,20 +750,20 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5)
     return total_loss / len(loader)
 
 
-def validate(model, loader, device):
+def validate(model, loader, device, metric='crps'):
     """
     Evaluate the model on a validation or test DataLoader.
 
-    No gradients are computed. Returns mean NLL loss.
-
     Args:
-        model:  ProbabilisticForecaster
-        loader: DataLoader (val or test)
-        device: torch.device
+        model:   ProbabilisticForecaster
+        loader:  DataLoader (val or test)
+        device:  torch.device
+        metric:  'crps' (default) or 'nll' — which loss to return
 
     Returns:
-        Mean NLL loss over all batches.
+        Mean loss over all batches.
     """
+    loss_fn = crps_gaussian_loss if metric == 'crps' else beta_nll_loss
     model.eval()
     total_loss = 0.0
 
@@ -701,65 +773,85 @@ def validate(model, loader, device):
             y = y.to(device)
 
             mu, sigma = model(x)
-            loss = gaussian_nll_loss(mu, sigma, y)
-            total_loss += loss.item()
+            total_loss += loss_fn(mu, sigma, y).item()
 
     return total_loss / len(loader)
 
 
-def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS):
+def train(model, train_loader, val_loader, device, weights_path,
+          n_epochs=EPOCHS, pretrain_epochs=PRETRAIN_EPOCHS):
     """
-    Full training loop with early stopping on validation NLL.
+    Two-phase training loop with CRPS-based early stopping.
 
-    Trains for up to n_epochs epochs. After each epoch, evaluates on the
-    validation set. Saves the best model weights whenever validation loss
-    improves. Stops early if validation loss has not improved for
-    PATIENCE consecutive epochs.
+    Phase 1 — MSE pretraining (pretrain_epochs epochs, no early stopping):
+        Trains on mu only so the decoder learns accurate mean predictions
+        before sigma is introduced. Teacher forcing held at 1.0 throughout.
+
+    Phase 2 — Beta-NLL training (up to n_epochs, early stopping on val CRPS):
+        Switches to Beta-NLL loss, which prevents sigma collapse by
+        stop-gradient-weighting each term. Teacher forcing decays linearly
+        from 1.0 → 0.0. Best checkpoint selected by validation CRPS.
 
     Args:
-        model:        ProbabilisticForecaster
-        train_loader: training DataLoader
-        val_loader:   validation DataLoader
-        device:       torch.device
-        weights_path: path to save best model .pt file
-        n_epochs:     maximum number of training epochs (default: EPOCHS)
+        model:           ProbabilisticForecaster
+        train_loader:    training DataLoader
+        val_loader:      validation DataLoader
+        device:          torch.device
+        weights_path:    path to save best model .pt file
+        n_epochs:        max Phase-2 epochs (default: EPOCHS)
+        pretrain_epochs: Phase-1 MSE epochs (default: PRETRAIN_EPOCHS)
 
     Returns:
-        history: dict with keys "train_loss" and "val_loss" (lists of floats)
+        history: dict with keys "phase1_train_mse", "train_loss", "val_crps"
     """
     PATIENCE = 10
 
     optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
-    # Reduce learning rate by 0.5 when val loss plateaus for 5 epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="min", factor=0.5, patience=3
     )
 
-    best_val_loss = float("inf")
-    epochs_without_improvement = 0
-    history = {"train_loss": [], "val_loss": []}
+    history = {"phase1_train_mse": [], "train_loss": [], "val_crps": []}
 
-    print(f"\n[TRAIN] Starting training for up to {n_epochs} epochs "
+    # -------------------------------------------------------------------------
+    # Phase 1: MSE pretraining
+    # -------------------------------------------------------------------------
+    mse_fn = lambda mu, _, y: mse_loss_mu(mu, y)
+
+    print(f"\n[TRAIN] Phase 1: MSE pretraining for {pretrain_epochs} epochs")
+    print(f"[TRAIN] Device: {device}\n")
+
+    for epoch in range(1, pretrain_epochs + 1):
+        train_mse = train_one_epoch(model, train_loader, optimiser, device,
+                                    teacher_forcing_ratio=1.0, loss_fn=mse_fn)
+        history["phase1_train_mse"].append(train_mse)
+        print(f"  Phase1 Epoch {epoch:02d}/{pretrain_epochs} | Train MSE: {train_mse:.4f}")
+
+    # -------------------------------------------------------------------------
+    # Phase 2: Beta-NLL with CRPS early stopping
+    # -------------------------------------------------------------------------
+    best_val_crps = float("inf")
+    epochs_without_improvement = 0
+
+    print(f"\n[TRAIN] Phase 2: Beta-NLL training for up to {n_epochs} epochs "
           f"(early stopping patience={PATIENCE})")
-    print(f"[TRAIN] Device: {device}")
     print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
 
     for epoch in range(1, n_epochs + 1):
-        # Teacher forcing ratio decays linearly from 1.0 → 0.0 over all epochs
-        tf_ratio = max(0.0, 1.0 - (epoch - 1) / n_epochs)
+        tf_ratio   = max(0.0, 1.0 - (epoch - 1) / n_epochs)
         train_loss = train_one_epoch(model, train_loader, optimiser, device,
-                                     teacher_forcing_ratio=tf_ratio)
-        val_loss = validate(model, val_loader, device)
+                                     teacher_forcing_ratio=tf_ratio,
+                                     loss_fn=beta_nll_loss)
+        val_crps   = validate(model, val_loader, device, metric='crps')
 
-        scheduler.step(val_loss)
+        scheduler.step(val_crps)
 
         history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
+        history["val_crps"].append(val_crps)
 
-        # Early stopping check
-        improved = val_loss < best_val_loss
+        improved = val_crps < best_val_crps
         if improved:
-            best_val_loss = val_loss
+            best_val_crps = val_crps
             epochs_without_improvement = 0
             torch.save(model.state_dict(), weights_path)
             marker = " *"
@@ -769,8 +861,8 @@ def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS
 
         print(
             f"Epoch {epoch:03d}/{n_epochs} | "
-            f"Train NLL: {train_loss:.4f} | "
-            f"Val NLL: {val_loss:.4f} | "
+            f"Train Beta-NLL: {train_loss:.4f} | "
+            f"Val CRPS: {val_crps:.4f} | "
             f"TF: {tf_ratio:.2f}"
             f"{marker}"
         )
@@ -780,7 +872,7 @@ def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS
                   f"(no improvement for {PATIENCE} epochs)")
             break
 
-    print(f"\n[TRAIN] Done. Best val NLL: {best_val_loss:.4f} — weights saved to {weights_path}")
+    print(f"\n[TRAIN] Done. Best val CRPS: {best_val_crps:.4f} — weights saved to {weights_path}")
     return history
 
 
@@ -865,8 +957,10 @@ def main(max_records=None, n_epochs=EPOCHS):
     # --- Step 7: Evaluate on test set ---
     print("\n[EVAL] Loading best weights for test evaluation...")
     model.load_state_dict(torch.load(weights_path, map_location=device))
-    test_nll = validate(model, test_loader, device)
-    print(f"[EVAL] Test NLL: {test_nll:.4f}")
+    test_crps = validate(model, test_loader, device, metric='crps')
+    test_nll  = validate(model, test_loader, device, metric='nll')
+    print(f"[EVAL] Test CRPS: {test_crps:.4f}")
+    print(f"[EVAL] Test Beta-NLL: {test_nll:.4f}")
 
     # --- Step 8: Save normalisation stats and split config ---
     stats_path = os.path.join(MODELS_DIR, "normalisation_stats.pt")
