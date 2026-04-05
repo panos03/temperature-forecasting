@@ -64,7 +64,6 @@ VAL_END_YEAR = 2021       # Val:   2020-2021
 
 # Training settings
 EPOCHS = 100
-PRETRAIN_EPOCHS = 15    # Phase 1: MSE pretraining epochs before switching to Beta-NLL
 LEARNING_RATE = 3e-4
 SEED = 42
 
@@ -639,15 +638,6 @@ class ProbabilisticForecaster(torch.nn.Module):
 # SECTION 6: LOSS FUNCTION AND TRAINING LOOP
 # =============================================================================
 
-def mse_loss_mu(mu, target):
-    """
-    MSE on predicted means only.
-    Used in phase-1 pretraining to establish good mu estimates before
-    sigma is introduced, preventing early sigma collapse.
-    """
-    return torch.mean((mu - target) ** 2)
-
-
 def beta_nll_loss(mu, sigma, target, beta=0.5):
     """
     Beta-NLL loss (Seitzer et al. 2022).
@@ -732,11 +722,7 @@ def zero_inflated_crps_loss(mu, sigma, p_rain, y):
     return (crps_other * len(non_p) + precip_loss) / mu.shape[-1]
 
 
-def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, phase=2):
-    """
-    phase=1: MSE on mu only (pretraining)
-    phase=2: zero-inflated CRPS (main training)
-    """
+def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5):
     model.train()
     total_loss = 0.0
 
@@ -746,10 +732,7 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5,
 
         optimiser.zero_grad()
         mu, sigma, p_rain = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
-        if phase == 1:
-            loss = mse_loss_mu(mu, y)
-        else:
-            loss = zero_inflated_crps_loss(mu, sigma, p_rain, y)
+        loss = zero_inflated_crps_loss(mu, sigma, p_rain, y)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -789,31 +772,24 @@ def validate(model, loader, device, metric='crps'):
     return total_loss / len(loader)
 
 
-def train(model, train_loader, val_loader, device, weights_path,
-          n_epochs=EPOCHS, pretrain_epochs=PRETRAIN_EPOCHS):
+def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS):
     """
-    Two-phase training loop with CRPS-based early stopping.
+    Training loop with CRPS loss and early stopping on validation CRPS.
 
-    Phase 1 — MSE pretraining (pretrain_epochs epochs, no early stopping):
-        Trains on mu only so the decoder learns accurate mean predictions
-        before sigma is introduced. Teacher forcing held at 1.0 throughout.
-
-    Phase 2 — CRPS training (up to n_epochs, early stopping on val CRPS):
-        Trains directly on zero_inflated_crps_loss, jointly optimising
-        accuracy and calibration. Teacher forcing decays linearly from
-        1.0 → 0.0. Best checkpoint selected by validation CRPS.
+    Trains directly on zero_inflated_crps_loss, jointly optimising accuracy
+    and calibration. Teacher forcing decays linearly from 1.0 → 0.0 over all
+    epochs. Best checkpoint selected by validation CRPS.
 
     Args:
-        model:           ProbabilisticForecaster
-        train_loader:    training DataLoader
-        val_loader:      validation DataLoader
-        device:          torch.device
-        weights_path:    path to save best model .pt file
-        n_epochs:        max Phase-2 epochs (default: EPOCHS)
-        pretrain_epochs: Phase-1 MSE epochs (default: PRETRAIN_EPOCHS)
+        model:        ProbabilisticForecaster
+        train_loader: training DataLoader
+        val_loader:   validation DataLoader
+        device:       torch.device
+        weights_path: path to save best model .pt file
+        n_epochs:     maximum training epochs (default: EPOCHS)
 
     Returns:
-        history: dict with keys "phase1_train_mse", "train_loss", "val_crps"
+        history: dict with keys "train_loss" and "val_crps"
     """
     PATIENCE = 15
 
@@ -822,35 +798,19 @@ def train(model, train_loader, val_loader, device, weights_path,
         optimiser, mode="min", factor=0.5, patience=3
     )
 
-    history = {"phase1_train_mse": [], "train_loss": [], "val_crps": []}
-
-    # -------------------------------------------------------------------------
-    # Phase 1: MSE pretraining
-    # -------------------------------------------------------------------------
-    print(f"\n[TRAIN] Phase 1: MSE pretraining for {pretrain_epochs} epochs")
-    print(f"[TRAIN] Device: {device}\n")
-
-    for epoch in range(1, pretrain_epochs + 1):
-        train_mse = train_one_epoch(model, train_loader, optimiser, device,
-                                    teacher_forcing_ratio=1.0, phase=1)
-        history["phase1_train_mse"].append(train_mse)
-        print(f"  Phase1 Epoch {epoch:02d}/{pretrain_epochs} | Train MSE: {train_mse:.4f}")
-
-    # -------------------------------------------------------------------------
-    # Phase 2: Beta-NLL with CRPS early stopping
-    # -------------------------------------------------------------------------
     best_val_crps = float("inf")
     epochs_without_improvement = 0
+    history = {"train_loss": [], "val_crps": []}
 
-    print(f"\n[TRAIN] Phase 2: CRPS training for up to {n_epochs} epochs "
+    print(f"\n[TRAIN] Starting training for up to {n_epochs} epochs "
           f"(early stopping patience={PATIENCE})")
+    print(f"[TRAIN] Device: {device}")
     print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
 
     for epoch in range(1, n_epochs + 1):
         tf_ratio   = max(0.0, 1.0 - (epoch - 1) / n_epochs)
         train_loss = train_one_epoch(model, train_loader, optimiser, device,
-                                     teacher_forcing_ratio=tf_ratio,
-                                     phase=2)
+                                     teacher_forcing_ratio=tf_ratio)
         val_crps   = validate(model, val_loader, device, metric='crps')
 
         scheduler.step(val_crps)
