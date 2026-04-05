@@ -612,7 +612,7 @@ class ProbabilisticForecaster(torch.nn.Module):
         num_layers=2,
         target_days=TARGET_DAYS,
         num_targets=NUM_TARGET_FEATURES,
-        dropout=0.2,
+        dropout=0.3,
     ):
         super().__init__()
         self.encoder = Encoder(num_features, hidden_size, num_layers, dropout)
@@ -658,7 +658,7 @@ def gaussian_nll_loss(mu, sigma, target):
     return 0.5 * torch.mean(torch.log(variance) + (target - mu) ** 2 / variance)
 
 
-def train_one_epoch(model, loader, optimiser, device):
+def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5):
     model.train()
     total_loss = 0.0
 
@@ -667,8 +667,7 @@ def train_one_epoch(model, loader, optimiser, device):
         y = y.to(device)
 
         optimiser.zero_grad()
-        # Pass targets for teacher forcing during training
-        mu, sigma = model(x, targets=y, teacher_forcing_ratio=0.5)
+        mu, sigma = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
         loss = gaussian_nll_loss(mu, sigma, y)
         loss.backward()
 
@@ -730,7 +729,7 @@ def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS
     """
     PATIENCE = 10
 
-    optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     # Reduce learning rate by 0.5 when val loss plateaus for 5 epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="min", factor=0.5, patience=5
@@ -746,7 +745,10 @@ def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS
     print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
 
     for epoch in range(1, n_epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimiser, device)
+        # Teacher forcing ratio decays linearly from 1.0 → 0.0 over all epochs
+        tf_ratio = max(0.0, 1.0 - (epoch - 1) / n_epochs)
+        train_loss = train_one_epoch(model, train_loader, optimiser, device,
+                                     teacher_forcing_ratio=tf_ratio)
         val_loss = validate(model, val_loader, device)
 
         scheduler.step(val_loss)
@@ -768,7 +770,8 @@ def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS
         print(
             f"Epoch {epoch:03d}/{n_epochs} | "
             f"Train NLL: {train_loss:.4f} | "
-            f"Val NLL: {val_loss:.4f}"
+            f"Val NLL: {val_loss:.4f} | "
+            f"TF: {tf_ratio:.2f}"
             f"{marker}"
         )
 
