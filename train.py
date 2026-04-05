@@ -880,4 +880,4 @@ def main(max_records=None, n_epochs=EPOCHS):
 
 if __name__ == "__main__":
     # For a quick subset test use: main(max_records=500, n_epochs=20)
-    main(max_records=2000, n_epochs=30)
+    main()
