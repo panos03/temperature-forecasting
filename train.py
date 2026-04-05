@@ -105,8 +105,6 @@ TARGET_FEATURE_INDICES = [
     FEATURE_COLUMNS.index("wind_speed_mean_ms"),
 ]
 NUM_TARGET_FEATURES = len(TARGET_FEATURE_INDICES)  # 4
-# Index of precipitation within the 4 target variables (0=temp, 1=humidity, 2=precip, 3=wind)
-PRECIP_TARGET_IDX   = TARGET_FEATURE_INDICES.index(FEATURE_COLUMNS.index("total_precipitation_mm"))
 # Output head: (mu, log_sigma) per target variable per timestep
 DECODER_OUTPUT_SIZE = NUM_TARGET_FEATURES * 2      # 8
 
@@ -531,8 +529,6 @@ class Decoder(torch.nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.output_head = torch.nn.Linear(hidden_size, num_targets * 2)
-        # Separate head for precipitation zero-inflation probability
-        self.precip_head = torch.nn.Linear(hidden_size, 1)
 
     def forward(self, h, c, targets=None, teacher_forcing_ratio=0.5):
         """
@@ -543,12 +539,11 @@ class Decoder(torch.nn.Module):
             teacher_forcing_ratio: P(use ground truth as next input)
 
         Returns:
-            mu:     (batch, target_days, num_targets)
-            sigma:  (batch, target_days, num_targets)
-            p_rain: (batch, target_days, 1) — P(precipitation > 0)
+            mu:    (batch, target_days, num_targets)
+            sigma: (batch, target_days, num_targets)
         """
         batch_size = h.shape[1]
-        all_mu, all_sigma, all_p_rain = [], [], []
+        all_mu, all_sigma = [], []
 
         current_input = self.start_embedding.expand(batch_size, 1, -1)
 
@@ -563,11 +558,9 @@ class Decoder(torch.nn.Module):
             mu        = projected[..., 0]                        # (batch, num_targets)
             log_sigma = torch.clamp(projected[..., 1], min=-6.0, max=2.0)
             sigma     = torch.exp(log_sigma)
-            p_rain    = torch.sigmoid(self.precip_head(out_flat))  # (batch, 1)
 
             all_mu.append(mu)
             all_sigma.append(sigma)
-            all_p_rain.append(p_rain)
 
             if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
                 next_input = targets[:, step, :]
@@ -575,11 +568,10 @@ class Decoder(torch.nn.Module):
                 next_input = mu.detach()
             current_input = next_input.unsqueeze(1)
 
-        mu_all     = torch.stack(all_mu,     dim=1)   # (batch, target_days, num_targets)
-        sigma_all  = torch.stack(all_sigma,  dim=1)
-        p_rain_all = torch.stack(all_p_rain, dim=1)   # (batch, target_days, 1)
+        mu_all    = torch.stack(all_mu,    dim=1)   # (batch, target_days, num_targets)
+        sigma_all = torch.stack(all_sigma, dim=1)
 
-        return mu_all, sigma_all, p_rain_all
+        return mu_all, sigma_all
 
 
 class ProbabilisticForecaster(torch.nn.Module):
@@ -594,9 +586,8 @@ class ProbabilisticForecaster(torch.nn.Module):
         Decoder LSTM  (learned start embedding -> hidden_size)
               |
         output_head   (hidden_size -> 4*2)   mu, sigma for all variables
-        precip_head   (hidden_size -> 1)     logit(p_rain) for precipitation
               |
-        mu, sigma, p_rain   (batch, 7, 4) / (batch, 7, 4) / (batch, 7, 1)
+        mu, sigma   (batch, 7, 4) / (batch, 7, 4)
 
     Designed for a T4 GPU on Google Colab:
         hidden_size=128, num_layers=2 -> ~470k parameters, fits comfortably
@@ -631,9 +622,9 @@ class ProbabilisticForecaster(torch.nn.Module):
             teacher_forcing_ratio: passed to decoder (ignored at inference)
         """
         h, c = self.encoder(x)
-        mu, sigma, p_rain = self.decoder(h, c, targets=targets,
-                                         teacher_forcing_ratio=teacher_forcing_ratio)
-        return mu, sigma, p_rain
+        mu, sigma = self.decoder(h, c, targets=targets,
+                                 teacher_forcing_ratio=teacher_forcing_ratio)
+        return mu, sigma
 
 # =============================================================================
 # SECTION 6: LOSS FUNCTION AND TRAINING LOOP
@@ -685,37 +676,8 @@ def crps_gaussian_loss(mu, sigma, y):
     return crps.mean()
 
 
-def zero_inflated_crps_loss(mu, sigma, p_rain, y):
-    """
-    CRPS loss with a zero-inflated auxiliary BCE term for precipitation.
-
-    All 4 variables receive full Gaussian CRPS — sigma always gets gradient
-    on every day for every variable. A separate BCE term trains p_rain to
-    predict rain occurrence independently, without scaling or blocking the
-    CRPS gradient.
-
-    The previous formulation (p * crps_p) starved sigma of gradient on dry
-    days (~40% of data), causing systematic overconfidence across all variables.
-
-    Args:
-        mu:     (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
-        sigma:  (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
-        p_rain: (batch, TARGET_DAYS, 1) — P(precipitation > 0)
-        y:      (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
-    """
-    # Full Gaussian CRPS for all 4 variables — unweighted
-    crps_all = crps_gaussian_loss(mu, sigma, y)
-
-    # Auxiliary BCE to train p_rain for rain/no-rain classification
-    p      = p_rain.squeeze(-1).clamp(1e-6, 1 - 1e-6)
-    y_rain = (y[..., PRECIP_TARGET_IDX] > 0).float()
-    bce    = -(y_rain * torch.log(p) + (1 - y_rain) * torch.log(1 - p)).mean()
-
-    return crps_all + 0.5 * bce
-
-
 def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, phase=2):
-    """phase=1: MSE on mu only  |  phase=2: zero-inflated CRPS"""
+    """phase=1: MSE on mu only  |  phase=2: CRPS"""
     model.train()
     total_loss = 0.0
 
@@ -724,8 +686,8 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5,
         y = y.to(device)
 
         optimiser.zero_grad()
-        mu, sigma, p_rain = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
-        loss = mse_loss_mu(mu, y) if phase == 1 else zero_inflated_crps_loss(mu, sigma, p_rain, y)
+        mu, sigma = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
+        loss = mse_loss_mu(mu, y) if phase == 1 else crps_gaussian_loss(mu, sigma, y)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -756,9 +718,9 @@ def validate(model, loader, device, metric='crps'):
             x = x.to(device)
             y = y.to(device)
 
-            mu, sigma, p_rain = model(x)
+            mu, sigma = model(x)
             if metric == 'crps':
-                total_loss += zero_inflated_crps_loss(mu, sigma, p_rain, y).item()
+                total_loss += crps_gaussian_loss(mu, sigma, y).item()
             else:
                 total_loss += beta_nll_loss(mu, sigma, y).item()
 
@@ -776,7 +738,7 @@ def train(model, train_loader, val_loader, device, weights_path,
         training and starving sigma of gradient.
 
     Phase 2 — CRPS training (up to n_epochs, early stopping on val CRPS):
-        Trains on zero_inflated_crps_loss. Teacher forcing decays linearly
+        Trains on crps_gaussian_loss. Teacher forcing decays linearly
         1.0 → 0.0. Best checkpoint selected by validation CRPS.
 
     Args:
