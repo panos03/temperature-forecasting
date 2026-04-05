@@ -66,6 +66,18 @@ VAL_END_YEAR = 2021       # Val:   2020-2021
 EPOCHS = 100
 PRETRAIN_EPOCHS = 15    # Phase 1: MSE pretraining epochs before switching to Beta-NLL
 LEARNING_RATE = 3e-4
+SEED = 42
+
+
+def set_seed(seed=SEED):
+    """
+    Fix all random seeds and disable cuDNN non-determinism.
+    Call once at the start of main() to ensure reproducible training runs.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # Daily CSV column order (output of preprocessing)
 DAILY_COLUMNS = [
@@ -431,9 +443,11 @@ def create_dataloaders(train_data, val_data, test_data, batch_size=BATCH_SIZE):
     print(f"[DATALOADER] Val windows:   {len(val_dataset)}")
     print(f"[DATALOADER] Test windows:  {len(test_dataset)}")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader, test_loader
 
@@ -908,6 +922,7 @@ def main(max_records=None, n_epochs=EPOCHS):
                      split instead of the calendar-year split.
         n_epochs:    maximum training epochs (default: EPOCHS constant)
     """
+    set_seed()
     print("=" * 70)
     print("Probabilistic Weather Forecasting - Minas Gerais Coffee Belt")
     print("=" * 70)
