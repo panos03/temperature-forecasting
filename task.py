@@ -600,7 +600,7 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     summary_path = os.path.join(RESULTS_DIR, "summary.txt")
-    with open(summary_path, "a") as f:
+    with open(summary_path, "w") as f:
         f.write("\n".join(lines) + "\n\n")
     print(f"  Summary appended -> {summary_path}")
 

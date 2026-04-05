@@ -1,16 +1,16 @@
 === Results (real) ===
-  NLL:  1.0041
-  CRPS: 0.4009
-  RMSE: 0.7875
-  MAE:  0.5609
+  NLL:  1.0579
+  CRPS: 0.3980
+  RMSE: 0.7810
+  MAE:  0.5505
   Coverage:
-     50% interval -> 55.9% empirical
-     80% interval -> 82.7% empirical
-     90% interval -> 90.5% empirical
-     95% interval -> 94.7% empirical
+     50% interval -> 52.4% empirical
+     80% interval -> 77.9% empirical
+     90% interval -> 86.6% empirical
+     95% interval -> 91.3% empirical
   RMSE per variable:
-    temperature_mean_c: 0.6379
-    relative_humidity_mean_pct: 0.7762
-    total_precipitation_mm: 0.8250
-    wind_speed_mean_ms: 0.8893
+    temperature_mean_c: 0.6271
+    relative_humidity_mean_pct: 0.7665
+    total_precipitation_mm: 0.8260
+    wind_speed_mean_ms: 0.8814
 
