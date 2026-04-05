@@ -21,6 +21,7 @@ from train import (
     WeatherWindowDataset,
     FEATURE_COLUMNS,
     TARGET_FEATURE_INDICES,
+    PRECIP_TARGET_IDX,
     MODELS_DIR,
 )
 
@@ -683,17 +684,25 @@ def real_data_test():
     print(f"[EVAL] Loaded model from {weights_path}  (device: {device})")
 
     # ---- Collect predictions ----
-    all_mu, all_sigma, all_y = [], [], []
+    all_mu, all_sigma, all_p_rain, all_y = [], [], [], []
     with torch.no_grad():
         for x, y in test_loader:
-            mu, sigma = model(x.to(device))
+            mu, sigma, p_rain = model(x.to(device))
             all_mu.append(mu.cpu())
             all_sigma.append(sigma.cpu())
+            all_p_rain.append(p_rain.cpu())
             all_y.append(y.cpu())
 
-    mu_norm    = torch.cat(all_mu,    dim=0)
-    sigma_norm = torch.cat(all_sigma, dim=0)
-    y_norm     = torch.cat(all_y,     dim=0)
+    mu_norm     = torch.cat(all_mu,     dim=0)
+    sigma_norm  = torch.cat(all_sigma,  dim=0)
+    p_rain_norm = torch.cat(all_p_rain, dim=0)
+    y_norm      = torch.cat(all_y,      dim=0)
+
+    # For precipitation, replace mu with the expected value: p_rain * mu_amount
+    mu_norm = mu_norm.clone()
+    mu_norm[..., PRECIP_TARGET_IDX] = (
+        p_rain_norm.squeeze(-1) * mu_norm[..., PRECIP_TARGET_IDX]
+    )
 
     # ---- Denormalise for interpretable plots ----
     t_mean     = train_mean[TARGET_FEATURE_INDICES]

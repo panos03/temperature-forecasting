@@ -105,6 +105,8 @@ TARGET_FEATURE_INDICES = [
     FEATURE_COLUMNS.index("wind_speed_mean_ms"),
 ]
 NUM_TARGET_FEATURES = len(TARGET_FEATURE_INDICES)  # 4
+# Index of precipitation within the 4 target variables (0=temp, 1=humidity, 2=precip, 3=wind)
+PRECIP_TARGET_IDX   = TARGET_FEATURE_INDICES.index(FEATURE_COLUMNS.index("total_precipitation_mm"))
 # Output head: (mu, log_sigma) per target variable per timestep
 DECODER_OUTPUT_SIZE = NUM_TARGET_FEATURES * 2      # 8
 
@@ -484,63 +486,31 @@ class Encoder(torch.nn.Module):
         Args:
             x: (batch, INPUT_DAYS, num_features)
         Returns:
-            outputs: (batch, INPUT_DAYS, hidden_size) — all timestep outputs for attention
-            h:       (num_layers, batch, hidden_size) — hidden state for decoder init
-            c:       (num_layers, batch, hidden_size) — cell state for decoder init
+            h: (num_layers, batch, hidden_size) — hidden state for decoder init
+            c: (num_layers, batch, hidden_size) — cell state for decoder init
         """
-        outputs, (h, c) = self.lstm(x)
-        return outputs, h, c
-
-
-class Attention(torch.nn.Module):
-    """
-    Bahdanau-style additive attention.
-
-    At each decoder step, scores all encoder timesteps and returns a weighted
-    context vector. This lets the decoder focus on the most relevant past days
-    rather than relying solely on the encoder's final hidden state.
-
-    Args:
-        hidden_size: must match encoder and decoder hidden_size
-    """
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.attn = torch.nn.Linear(hidden_size * 2, hidden_size)
-        self.v    = torch.nn.Linear(hidden_size, 1, bias=False)
-
-    def forward(self, query, keys):
-        """
-        Args:
-            query: (batch, hidden_size)          — last-layer decoder hidden state
-            keys:  (batch, seq_len, hidden_size) — encoder outputs
-        Returns:
-            context:      (batch, hidden_size)
-            attn_weights: (batch, seq_len)
-        """
-        seq_len = keys.shape[1]
-        query   = query.unsqueeze(1).expand(-1, seq_len, -1)               # (batch, seq_len, hidden)
-        energy  = torch.tanh(self.attn(torch.cat([query, keys], dim=2)))   # (batch, seq_len, hidden)
-        weights = torch.softmax(self.v(energy).squeeze(2), dim=1)          # (batch, seq_len)
-        context = torch.bmm(weights.unsqueeze(1), keys).squeeze(1)         # (batch, hidden)
-        return context, weights
+        _, (h, c) = self.lstm(x)
+        return h, c
 
 
 class Decoder(torch.nn.Module):
     """
-    Autoregressive LSTM decoder.
+    Autoregressive LSTM decoder with a zero-inflated precipitation head.
 
-    At each step, the LSTM input is the previous step's predicted mu values
-    (or during training, the ground truth values — teacher forcing).
+    At each step the LSTM input is the previous step's predicted mu values
+    (or ground truth during training — teacher forcing).
+    Step 0 is seeded with a learned start embedding.
 
-    Step 0 is seeded with a learned start embedding since there is no
-    previous prediction at the first step.
+    The standard output_head produces (mu, log_sigma) for all 4 target
+    variables. A separate precip_head produces logit(p_rain), the probability
+    of non-zero precipitation, used by the zero-inflated loss.
 
     Args:
         hidden_size:        Must match encoder hidden_size
         num_layers:         Must match encoder num_layers
         target_days:        Forecast horizon (7)
         num_targets:        Number of predicted variables (4)
-        num_input_features: Full feature size for teacher forcing input (4)
+        num_input_features: Feature size for teacher forcing input (4)
         dropout:            Dropout between LSTM layers
     """
     def __init__(self, hidden_size, num_layers, target_days, num_targets,
@@ -549,90 +519,67 @@ class Decoder(torch.nn.Module):
         self.target_days = target_days
         self.num_targets = num_targets
 
-        # Learned start token — seeds the first decoder step
-        # (equivalent to the old step_embeddings[0] only)
         self.start_embedding = torch.nn.Parameter(
             torch.zeros(1, 1, num_input_features)
         )
-
-        # Input projection: map num_targets -> hidden_size
-        # because LSTM expects input_size == hidden_size here
-        self.input_proj = torch.nn.Linear(num_input_features, hidden_size)
-
-        self.lstm = torch.nn.LSTM(
+        self.input_proj  = torch.nn.Linear(num_input_features, hidden_size)
+        self.lstm        = torch.nn.LSTM(
             input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
+        self.output_head = torch.nn.Linear(hidden_size, num_targets * 2)
+        # Separate head for precipitation zero-inflation probability
+        self.precip_head = torch.nn.Linear(hidden_size, 1)
 
-        self.attention  = Attention(hidden_size)
-        # Output head takes LSTM output + attention context concatenated
-        self.output_head = torch.nn.Linear(hidden_size * 2, num_targets * 2)
-
-    def forward(self, encoder_outputs, h, c, targets=None, teacher_forcing_ratio=0.5):
+    def forward(self, h, c, targets=None, teacher_forcing_ratio=0.5):
         """
         Args:
-            encoder_outputs:      (batch, INPUT_DAYS, hidden_size) — all encoder timesteps
             h:                    (num_layers, batch, hidden_size) from encoder
             c:                    (num_layers, batch, hidden_size) from encoder
-            targets:              (batch, target_days, num_targets) ground truth,
-                                  or None at inference time
-            teacher_forcing_ratio: probability of using ground truth as next input
-                                  (1.0 = always use truth, 0.0 = always use prediction)
+            targets:              (batch, target_days, num_targets) or None
+            teacher_forcing_ratio: P(use ground truth as next input)
 
         Returns:
-            mu:    (batch, target_days, num_targets)
-            sigma: (batch, target_days, num_targets)
+            mu:     (batch, target_days, num_targets)
+            sigma:  (batch, target_days, num_targets)
+            p_rain: (batch, target_days, 1) — P(precipitation > 0)
         """
         batch_size = h.shape[1]
+        all_mu, all_sigma, all_p_rain = [], [], []
 
-        all_mu = []
-        all_sigma = []
-
-        # Seed the first step with the learned start embedding
-        current_input = self.start_embedding.expand(batch_size, 1, -1)   # (batch, 1, num_targets)
+        current_input = self.start_embedding.expand(batch_size, 1, -1)
 
         for step in range(self.target_days):
-            # Project input to hidden_size
-            step_input = self.input_proj(current_input)          # (batch, 1, hidden_size)
+            step_input       = self.input_proj(current_input)    # (batch, 1, hidden_size)
+            out, (h, c)      = self.lstm(step_input, (h, c))    # (batch, 1, hidden_size)
+            out_flat         = out.squeeze(1)                    # (batch, hidden_size)
 
-            # One LSTM step
-            out, (h, c) = self.lstm(step_input, (h, c))         # out: (batch, 1, hidden_size)
-
-            # Attention: query is last-layer hidden state, keys are encoder outputs
-            query   = h[-1]                                      # (batch, hidden_size)
-            context, _ = self.attention(query, encoder_outputs)  # (batch, hidden_size)
-
-            # Concatenate LSTM output with attention context
-            out_flat = out.squeeze(1)                            # (batch, hidden_size)
-            out_ctx  = torch.cat([out_flat, context], dim=1)    # (batch, hidden_size*2)
-
-            # Project to (mu, log_sigma)
-            projected = self.output_head(out_ctx)                # (batch, num_targets*2)
+            projected = self.output_head(out_flat)               # (batch, num_targets*2)
             projected = projected.view(batch_size, self.num_targets, 2)
 
             mu        = projected[..., 0]                        # (batch, num_targets)
-            log_sigma = projected[..., 1]
-            log_sigma = torch.clamp(log_sigma, min=-6.0, max=2.0)
+            log_sigma = torch.clamp(projected[..., 1], min=-6.0, max=2.0)
             sigma     = torch.exp(log_sigma)
+            p_rain    = torch.sigmoid(self.precip_head(out_flat))  # (batch, 1)
 
             all_mu.append(mu)
             all_sigma.append(sigma)
+            all_p_rain.append(p_rain)
 
-            # --- Decide next input: teacher forcing or own prediction ---
             if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                next_input = targets[:, step, :]                 # (batch, num_targets)
+                next_input = targets[:, step, :]
             else:
-                next_input = mu.detach()                         # (batch, num_targets)
+                next_input = mu.detach()
+            current_input = next_input.unsqueeze(1)
 
-            current_input = next_input.unsqueeze(1)              # (batch, 1, num_targets)
+        mu_all     = torch.stack(all_mu,     dim=1)   # (batch, target_days, num_targets)
+        sigma_all  = torch.stack(all_sigma,  dim=1)
+        p_rain_all = torch.stack(all_p_rain, dim=1)   # (batch, target_days, 1)
 
-        mu_all    = torch.stack(all_mu,    dim=1)                # (batch, target_days, num_targets)
-        sigma_all = torch.stack(all_sigma, dim=1)
-
-        return mu_all, sigma_all
+        return mu_all, sigma_all, p_rain_all
 
 
 class ProbabilisticForecaster(torch.nn.Module):
@@ -640,19 +587,19 @@ class ProbabilisticForecaster(torch.nn.Module):
     Full encoder-decoder model for probabilistic multi-step weather forecasting.
 
     Architecture summary:
-        Encoder LSTM  (9 features in  -> hidden_size)
+        Encoder LSTM  (9 features in -> hidden_size)
               |
-        all outputs + (h, c)
+           (h, c)
               |
-        Decoder LSTM  (learned step embeddings -> hidden_size)
-              + Bahdanau attention over encoder outputs at each step
+        Decoder LSTM  (learned start embedding -> hidden_size)
               |
-        Linear head   (hidden_size*2 -> 4 * 2)
+        output_head   (hidden_size -> 4*2)   mu, sigma for all variables
+        precip_head   (hidden_size -> 1)     logit(p_rain) for precipitation
               |
-        mu, sigma     (batch, 7, 4)
+        mu, sigma, p_rain   (batch, 7, 4) / (batch, 7, 4) / (batch, 7, 1)
 
     Designed for a T4 GPU on Google Colab:
-        hidden_size=128, num_layers=2 -> ~530k parameters, fits comfortably
+        hidden_size=128, num_layers=2 -> ~470k parameters, fits comfortably
         in 16 GB VRAM with batch_size=64 and sequence length 30+7.
 
     Args:
@@ -683,10 +630,10 @@ class ProbabilisticForecaster(torch.nn.Module):
             targets:              (batch, TARGET_DAYS, NUM_TARGET_FEATURES) or None
             teacher_forcing_ratio: passed to decoder (ignored at inference)
         """
-        encoder_outputs, h, c = self.encoder(x)
-        mu, sigma = self.decoder(encoder_outputs, h, c, targets=targets,
-                                 teacher_forcing_ratio=teacher_forcing_ratio)
-        return mu, sigma
+        h, c = self.encoder(x)
+        mu, sigma, p_rain = self.decoder(h, c, targets=targets,
+                                         teacher_forcing_ratio=teacher_forcing_ratio)
+        return mu, sigma, p_rain
 
 # =============================================================================
 # SECTION 6: LOSS FUNCTION AND TRAINING LOOP
@@ -742,9 +689,54 @@ def crps_gaussian_loss(mu, sigma, y):
     return crps.mean()
 
 
-def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, loss_fn=None):
-    if loss_fn is None:
-        loss_fn = beta_nll_loss
+def zero_inflated_crps_loss(mu, sigma, p_rain, y):
+    """
+    CRPS loss with a zero-inflated hurdle model for precipitation.
+
+    Non-precipitation variables use standard Gaussian CRPS.
+    Precipitation uses a two-component hurdle model:
+        - BCE loss for rain/no-rain probability (p_rain vs observed indicator)
+        - Gaussian CRPS for the conditional amount, weighted by p_rain so the
+          model is not penalised for precise amounts on days it predicts as dry
+
+    Args:
+        mu:     (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+        sigma:  (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+        p_rain: (batch, TARGET_DAYS, 1) — P(precipitation > 0)
+        y:      (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
+    """
+    P = PRECIP_TARGET_IDX
+    p = p_rain.squeeze(-1).clamp(1e-6, 1 - 1e-6)       # (batch, target_days)
+
+    # Non-precipitation variables: standard Gaussian CRPS
+    non_p      = [i for i in range(mu.shape[-1]) if i != P]
+    crps_other = crps_gaussian_loss(mu[..., non_p], sigma[..., non_p], y[..., non_p])
+
+    # Precipitation: hurdle model
+    y_p    = y[..., P]
+    mu_p   = mu[..., P]
+    sig_p  = sigma[..., P].clamp(min=1e-6)
+    y_rain = (y_p > 0).float()
+
+    bce    = -(y_rain * torch.log(p) + (1 - y_rain) * torch.log(1 - p))
+
+    z      = (y_p - mu_p) / sig_p
+    normal = torch.distributions.Normal(0, 1)
+    phi    = torch.exp(normal.log_prob(z))
+    Phi    = normal.cdf(z)
+    crps_p = sig_p * (z * (2 * Phi - 1) + 2 * phi - 1.0 / math.sqrt(math.pi))
+
+    precip_loss = (bce + p * crps_p).mean()
+
+    # Average across all 4 variables equally
+    return (crps_other * len(non_p) + precip_loss) / mu.shape[-1]
+
+
+def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, phase=2):
+    """
+    phase=1: MSE on mu only (pretraining)
+    phase=2: zero-inflated CRPS (main training)
+    """
     model.train()
     total_loss = 0.0
 
@@ -753,8 +745,11 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5,
         y = y.to(device)
 
         optimiser.zero_grad()
-        mu, sigma = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
-        loss = loss_fn(mu, sigma, y)
+        mu, sigma, p_rain = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
+        if phase == 1:
+            loss = mse_loss_mu(mu, y)
+        else:
+            loss = zero_inflated_crps_loss(mu, sigma, p_rain, y)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -777,7 +772,6 @@ def validate(model, loader, device, metric='crps'):
     Returns:
         Mean loss over all batches.
     """
-    loss_fn = crps_gaussian_loss if metric == 'crps' else beta_nll_loss
     model.eval()
     total_loss = 0.0
 
@@ -786,8 +780,11 @@ def validate(model, loader, device, metric='crps'):
             x = x.to(device)
             y = y.to(device)
 
-            mu, sigma = model(x)
-            total_loss += loss_fn(mu, sigma, y).item()
+            mu, sigma, p_rain = model(x)
+            if metric == 'crps':
+                total_loss += zero_inflated_crps_loss(mu, sigma, p_rain, y).item()
+            else:
+                total_loss += beta_nll_loss(mu, sigma, y).item()
 
     return total_loss / len(loader)
 
@@ -801,10 +798,10 @@ def train(model, train_loader, val_loader, device, weights_path,
         Trains on mu only so the decoder learns accurate mean predictions
         before sigma is introduced. Teacher forcing held at 1.0 throughout.
 
-    Phase 2 — Beta-NLL training (up to n_epochs, early stopping on val CRPS):
-        Switches to Beta-NLL loss, which prevents sigma collapse by
-        stop-gradient-weighting each term. Teacher forcing decays linearly
-        from 1.0 → 0.0. Best checkpoint selected by validation CRPS.
+    Phase 2 — CRPS training (up to n_epochs, early stopping on val CRPS):
+        Trains directly on zero_inflated_crps_loss, jointly optimising
+        accuracy and calibration. Teacher forcing decays linearly from
+        1.0 → 0.0. Best checkpoint selected by validation CRPS.
 
     Args:
         model:           ProbabilisticForecaster
@@ -818,7 +815,7 @@ def train(model, train_loader, val_loader, device, weights_path,
     Returns:
         history: dict with keys "phase1_train_mse", "train_loss", "val_crps"
     """
-    PATIENCE = 10
+    PATIENCE = 15
 
     optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -830,14 +827,12 @@ def train(model, train_loader, val_loader, device, weights_path,
     # -------------------------------------------------------------------------
     # Phase 1: MSE pretraining
     # -------------------------------------------------------------------------
-    mse_fn = lambda mu, _, y: mse_loss_mu(mu, y)
-
     print(f"\n[TRAIN] Phase 1: MSE pretraining for {pretrain_epochs} epochs")
     print(f"[TRAIN] Device: {device}\n")
 
     for epoch in range(1, pretrain_epochs + 1):
         train_mse = train_one_epoch(model, train_loader, optimiser, device,
-                                    teacher_forcing_ratio=1.0, loss_fn=mse_fn)
+                                    teacher_forcing_ratio=1.0, phase=1)
         history["phase1_train_mse"].append(train_mse)
         print(f"  Phase1 Epoch {epoch:02d}/{pretrain_epochs} | Train MSE: {train_mse:.4f}")
 
@@ -847,7 +842,7 @@ def train(model, train_loader, val_loader, device, weights_path,
     best_val_crps = float("inf")
     epochs_without_improvement = 0
 
-    print(f"\n[TRAIN] Phase 2: Beta-NLL training for up to {n_epochs} epochs "
+    print(f"\n[TRAIN] Phase 2: CRPS training for up to {n_epochs} epochs "
           f"(early stopping patience={PATIENCE})")
     print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
 
@@ -855,7 +850,7 @@ def train(model, train_loader, val_loader, device, weights_path,
         tf_ratio   = max(0.0, 1.0 - (epoch - 1) / n_epochs)
         train_loss = train_one_epoch(model, train_loader, optimiser, device,
                                      teacher_forcing_ratio=tf_ratio,
-                                     loss_fn=beta_nll_loss)
+                                     phase=2)
         val_crps   = validate(model, val_loader, device, metric='crps')
 
         scheduler.step(val_crps)
@@ -875,7 +870,7 @@ def train(model, train_loader, val_loader, device, weights_path,
 
         print(
             f"Epoch {epoch:03d}/{n_epochs} | "
-            f"Train Beta-NLL: {train_loss:.4f} | "
+            f"Train CRPS: {train_loss:.4f} | "
             f"Val CRPS: {val_crps:.4f} | "
             f"TF: {tf_ratio:.2f}"
             f"{marker}"
