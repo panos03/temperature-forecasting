@@ -687,13 +687,15 @@ def crps_gaussian_loss(mu, sigma, y):
 
 def zero_inflated_crps_loss(mu, sigma, p_rain, y):
     """
-    CRPS loss with a zero-inflated hurdle model for precipitation.
+    CRPS loss with a zero-inflated auxiliary BCE term for precipitation.
 
-    Non-precipitation variables use standard Gaussian CRPS.
-    Precipitation uses a two-component hurdle model:
-        - BCE loss for rain/no-rain probability (p_rain vs observed indicator)
-        - Gaussian CRPS for the conditional amount, weighted by p_rain so the
-          model is not penalised for precise amounts on days it predicts as dry
+    All 4 variables receive full Gaussian CRPS — sigma always gets gradient
+    on every day for every variable. A separate BCE term trains p_rain to
+    predict rain occurrence independently, without scaling or blocking the
+    CRPS gradient.
+
+    The previous formulation (p * crps_p) starved sigma of gradient on dry
+    days (~40% of data), causing systematic overconfidence across all variables.
 
     Args:
         mu:     (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
@@ -701,31 +703,15 @@ def zero_inflated_crps_loss(mu, sigma, p_rain, y):
         p_rain: (batch, TARGET_DAYS, 1) — P(precipitation > 0)
         y:      (batch, TARGET_DAYS, NUM_TARGET_FEATURES)
     """
-    P = PRECIP_TARGET_IDX
-    p = p_rain.squeeze(-1).clamp(1e-6, 1 - 1e-6)       # (batch, target_days)
+    # Full Gaussian CRPS for all 4 variables — unweighted
+    crps_all = crps_gaussian_loss(mu, sigma, y)
 
-    # Non-precipitation variables: standard Gaussian CRPS
-    non_p      = [i for i in range(mu.shape[-1]) if i != P]
-    crps_other = crps_gaussian_loss(mu[..., non_p], sigma[..., non_p], y[..., non_p])
+    # Auxiliary BCE to train p_rain for rain/no-rain classification
+    p      = p_rain.squeeze(-1).clamp(1e-6, 1 - 1e-6)
+    y_rain = (y[..., PRECIP_TARGET_IDX] > 0).float()
+    bce    = -(y_rain * torch.log(p) + (1 - y_rain) * torch.log(1 - p)).mean()
 
-    # Precipitation: hurdle model
-    y_p    = y[..., P]
-    mu_p   = mu[..., P]
-    sig_p  = sigma[..., P].clamp(min=1e-6)
-    y_rain = (y_p > 0).float()
-
-    bce    = -(y_rain * torch.log(p) + (1 - y_rain) * torch.log(1 - p))
-
-    z      = (y_p - mu_p) / sig_p
-    normal = torch.distributions.Normal(0, 1)
-    phi    = torch.exp(normal.log_prob(z))
-    Phi    = normal.cdf(z)
-    crps_p = sig_p * (z * (2 * Phi - 1) + 2 * phi - 1.0 / math.sqrt(math.pi))
-
-    precip_loss = (bce + p * crps_p).mean()
-
-    # Average across all 4 variables equally
-    return (crps_other * len(non_p) + precip_loss) / mu.shape[-1]
+    return crps_all + 0.5 * bce
 
 
 def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, phase=2):
