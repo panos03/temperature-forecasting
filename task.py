@@ -580,19 +580,30 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
         label:                    short tag used in output filenames, e.g. 'dummy' or 'real'
     """
     results = evaluate_all(mu, sigma, y, var_names=var_names)
-    print(f"\n=== Results ({label}) ===")
-    print(f"  NLL:  {results['nll']:.4f}")
-    print(f"  CRPS: {results['crps']:.4f}")
-    print(f"  RMSE: {results['rmse']:.4f}")
-    print(f"  MAE:  {results['mae']:.4f}")
-    print("  Coverage:")
+
+    lines = []
+    lines.append(f"=== Results ({label}) ===")
+    lines.append(f"  NLL:  {results['nll']:.4f}")
+    lines.append(f"  CRPS: {results['crps']:.4f}")
+    lines.append(f"  RMSE: {results['rmse']:.4f}")
+    lines.append(f"  MAE:  {results['mae']:.4f}")
+    lines.append("  Coverage:")
     for cl, cov in results['coverage'].items():
-        print(f"    {int(cl*100):>3}% interval -> {cov*100:.1f}% empirical")
-    print("  RMSE per variable:")
+        lines.append(f"    {int(cl*100):>3}% interval -> {cov*100:.1f}% empirical")
+    lines.append("  RMSE per variable:")
     for var, val in results['rmse_per_var'].items():
-        print(f"    {var}: {val:.4f}")
+        lines.append(f"    {var}: {val:.4f}")
+
+    print()
+    for line in lines:
+        print(line)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "a") as f:
+        f.write("\n".join(lines) + "\n\n")
+    print(f"  Summary appended -> {summary_path}")
+
     plot_calibration(mu, sigma, y,
                      save_path=os.path.join(RESULTS_DIR, f'calibration_{label}.png'))
     # Visualise the first test-set window as a single representative example
@@ -698,7 +709,7 @@ def real_data_test():
 
 
 if __name__ == '__main__':
-    dummy_data_test()
+    #dummy_data_test()
     real_data_test()
 
 
