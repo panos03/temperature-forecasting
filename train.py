@@ -64,7 +64,7 @@ VAL_END_YEAR = 2021       # Val:   2020-2021
 
 # Training settings
 EPOCHS = 100
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 3e-4
 
 # Daily CSV column order (output of preprocessing)
 DAILY_COLUMNS = [
@@ -594,12 +594,12 @@ class ProbabilisticForecaster(torch.nn.Module):
         mu, sigma     (batch, 7, 4)
 
     Designed for a T4 GPU on Google Colab:
-        hidden_size=256, num_layers=2 -> ~2.5M parameters, fits comfortably
+        hidden_size=128, num_layers=2 -> ~460k parameters, fits comfortably
         in 16 GB VRAM with batch_size=64 and sequence length 30+7.
 
     Args:
         num_features:  Total encoder input features (9)
-        hidden_size:   LSTM hidden dimension (default 256)
+        hidden_size:   LSTM hidden dimension (default 128)
         num_layers:    Stacked LSTM layers in both encoder and decoder (default 2)
         target_days:   Forecast horizon (default 7)
         num_targets:   Variables to predict probabilistically (default 4)
@@ -608,7 +608,7 @@ class ProbabilisticForecaster(torch.nn.Module):
     def __init__(
         self,
         num_features=NUM_FEATURES,
-        hidden_size=256,
+        hidden_size=128,
         num_layers=2,
         target_days=TARGET_DAYS,
         num_targets=NUM_TARGET_FEATURES,
@@ -729,10 +729,10 @@ def train(model, train_loader, val_loader, device, weights_path, n_epochs=EPOCHS
     """
     PATIENCE = 10
 
-    optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     # Reduce learning rate by 0.5 when val loss plateaus for 5 epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode="min", factor=0.5, patience=5
+        optimiser, mode="min", factor=0.5, patience=3
     )
 
     best_val_loss = float("inf")
