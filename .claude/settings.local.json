@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where python:*)",
+      "Bash(conda info:*)",
+      "Bash(micromamba env:*)"
+    ]
+  }
+}
