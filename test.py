@@ -1529,24 +1529,30 @@ def synthetic_evaluation_demo():
 # Real-data evaluation — loads model saved by train.py, no training here
 # ---------------------------------------------------------------------------
 
-def real_data_test():
+def real_data_test(output_dir: str = DEFAULT_OUTPUT_DIR):
     """
-    Load the model saved by train.py, run inference on the test split, and
-    produce forecast and calibration plots with real predicted values.
+    Load the trained model from models/, run inference on the test split,
+    and produce the full evaluation suite (8 plots + 2 CSVs) via run_evaluation.
 
-    Run train.py first (e.g. main(max_records=500, n_epochs=5)) to generate
-    the required artefacts in the models/ directory.
+    Variable-order note
+    -------------------
+    train.py's model head emits axis-2 in the order defined by
+    TARGET_FEATURE_INDICES: [temperature, humidity, rainfall, wind].
+    run_evaluation expects axis-2 in the order used by VAR_NAMES:
+    [temperature, rainfall, humidity, wind].
+    The remapping index MODEL_TO_EVAL = [0, 2, 1, 3] is applied after
+    denormalisation so every downstream plot is labelled correctly.
     """
     _require_torch()
     from train import (
         FEATURE_COLUMNS,
+        INPUT_DAYS,
         ProbabilisticForecaster,
         TARGET_FEATURE_INDICES,
         WeatherWindowDataset,
         load_daily_data,
     )
 
-    local_var_names = [FEATURE_COLUMNS[i] for i in TARGET_FEATURE_INDICES]
     weights_path = os.path.join(MODELS_DIR, "best_model.pt")
     stats_path   = os.path.join(MODELS_DIR, "normalisation_stats.pt")
     config_path  = os.path.join(MODELS_DIR, "split_config.pt")
@@ -1558,14 +1564,14 @@ def real_data_test():
             )
 
     # ---- Load saved artefacts ----
-    stats       = torch.load(stats_path,  map_location="cpu")
-    config      = torch.load(config_path, map_location="cpu")
+    stats       = torch.load(stats_path,  map_location="cpu", weights_only=False)
+    config      = torch.load(config_path, map_location="cpu", weights_only=False)
     train_mean  = stats["mean"]
     train_std   = stats["std"]
     max_records = config["max_records"]
     split_fracs = config["split_fracs"]
 
-    # ---- Reconstruct test split using the same config (no retraining) ----
+    # ---- Reconstruct test split (mirrors train.py exactly) ----
     dates, features = load_daily_data(max_records=max_records)
     n = len(features)
     if split_fracs is not None:
@@ -1574,7 +1580,8 @@ def real_data_test():
         test_features = features[n_train + n_val:]
     else:
         from train import VAL_END_YEAR
-        test_features = features[[i for i, d in enumerate(dates) if int(d[:4]) > VAL_END_YEAR]]
+        test_idx      = [i for i, d in enumerate(dates) if int(d[:4]) > VAL_END_YEAR]
+        test_features = features[test_idx]
 
     test_data    = (test_features - train_mean) / train_std
     test_dataset = WeatherWindowDataset(test_data)
@@ -1583,34 +1590,55 @@ def real_data_test():
     # ---- Load model ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = ProbabilisticForecaster()
-    model.load_state_dict(torch.load(weights_path, map_location=device))
+    model.load_state_dict(
+        torch.load(weights_path, map_location=device, weights_only=True)
+    )
     model.to(device)
     model.eval()
     print(f"[EVAL] Loaded model from {weights_path}  (device: {device})")
 
-    # ---- Collect predictions ----
-    all_mu, all_sigma, all_y = [], [], []
+    # ---- Collect predictions and last observed day for persistence baseline ----
+    all_mu, all_sigma, all_y, all_last = [], [], [], []
     with torch.no_grad():
         for x, y in test_loader:
             mu, sigma = model(x.to(device))
             all_mu.append(mu.cpu())
             all_sigma.append(sigma.cpu())
             all_y.append(y.cpu())
+            # Last input day's target features (normalised): x[:, -1, TARGET_FEATURE_INDICES]
+            all_last.append(x[:, -1, :][:, TARGET_FEATURE_INDICES].cpu())
 
-    mu_norm    = torch.cat(all_mu,    dim=0)
+    mu_norm    = torch.cat(all_mu,    dim=0)   # (N, 7, 4)  model order
     sigma_norm = torch.cat(all_sigma, dim=0)
     y_norm     = torch.cat(all_y,     dim=0)
+    last_norm  = torch.cat(all_last,  dim=0)   # (N, 4)     model order
 
-    # ---- Denormalise for interpretable plots ----
-    t_mean     = train_mean[TARGET_FEATURE_INDICES]
+    # ---- Denormalise ----
+    t_mean     = train_mean[TARGET_FEATURE_INDICES]   # (4,) model order
     t_std      = train_std[TARGET_FEATURE_INDICES]
     mu_real    = (mu_norm    * t_std + t_mean).numpy()
-    sigma_real = (sigma_norm * t_std).numpy()
+    sigma_real = (sigma_norm * t_std          ).numpy()
     y_real     = (y_norm     * t_std + t_mean).numpy()
+    last_real  = (last_norm  * t_std + t_mean).numpy()
 
-    evaluate_and_plot(mu_norm, sigma_norm, y_norm,
-                      mu_real, sigma_real, y_real,
-                      var_names=local_var_names, label='real')
+    # ---- Remap variable axis from model order to evaluation order ----
+    # Model head order (TARGET_FEATURE_INDICES): temperature, humidity, rainfall, wind
+    # VAR_NAMES / run_evaluation order:          temperature, rainfall,  humidity, wind
+    MODEL_TO_EVAL = [0, 2, 1, 3]
+    mu_real    = mu_real[...,    MODEL_TO_EVAL]
+    sigma_real = sigma_real[..., MODEL_TO_EVAL]
+    y_real     = y_real[...,     MODEL_TO_EVAL]
+    last_real  = last_real[:,    MODEL_TO_EVAL]
+
+    # ---- Run comprehensive evaluation suite ----
+    run_evaluation(
+        y_true        = y_real,
+        mu_pred       = mu_real,
+        sigma_pred    = sigma_real,
+        last_observed = last_real,
+        output_dir    = output_dir,
+        var_names     = VAR_NAMES,
+    )
     print("\nReal data test complete.")
 
 
