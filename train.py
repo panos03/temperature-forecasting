@@ -676,8 +676,9 @@ def crps_gaussian_loss(mu, sigma, y):
     return crps.mean()
 
 
-def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, phase=2):
-    """phase=1: MSE on mu only  |  phase=2: CRPS"""
+def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, phase=2,
+                    phase2_loss='crps'):
+    """phase=1: MSE on mu only  |  phase=2: crps or nll (beta-NLL)"""
     model.train()
     total_loss = 0.0
 
@@ -687,7 +688,12 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5,
 
         optimiser.zero_grad()
         mu, sigma = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
-        loss = mse_loss_mu(mu, y) if phase == 1 else crps_gaussian_loss(mu, sigma, y)
+        if phase == 1:
+            loss = mse_loss_mu(mu, y)
+        elif phase2_loss == 'crps':
+            loss = crps_gaussian_loss(mu, sigma, y)
+        else:
+            loss = beta_nll_loss(mu, sigma, y)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -728,7 +734,7 @@ def validate(model, loader, device, metric='crps'):
 
 
 def train(model, train_loader, val_loader, device, weights_path,
-          n_epochs=EPOCHS, pretrain_epochs=PRETRAIN_EPOCHS):
+          n_epochs=EPOCHS, pretrain_epochs=PRETRAIN_EPOCHS, phase2_loss='crps'):
     """
     Two-phase training loop with CRPS-based early stopping.
 
@@ -775,29 +781,31 @@ def train(model, train_loader, val_loader, device, weights_path,
         print(f"  Phase1 Epoch {epoch:02d}/{pretrain_epochs} | Train MSE: {train_mse:.4f}")
 
     # -------------------------------------------------------------------------
-    # Phase 2: CRPS training with early stopping
+    # Phase 2: training with early stopping
     # -------------------------------------------------------------------------
-    best_val_crps = float("inf")
+    best_val = float("inf")
     epochs_without_improvement = 0
+    val_metric = 'crps' if phase2_loss == 'crps' else 'nll'
 
-    print(f"\n[TRAIN] Phase 2: CRPS training for up to {n_epochs} epochs "
+    print(f"\n[TRAIN] Phase 2: {phase2_loss.upper()} training for up to {n_epochs} epochs "
           f"(early stopping patience={PATIENCE})")
     print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
 
     for epoch in range(1, n_epochs + 1):
         tf_ratio   = max(0.0, 1.0 - (epoch - 1) / n_epochs)
         train_loss = train_one_epoch(model, train_loader, optimiser, device,
-                                     teacher_forcing_ratio=tf_ratio, phase=2)
-        val_crps   = validate(model, val_loader, device, metric='crps')
+                                     teacher_forcing_ratio=tf_ratio, phase=2,
+                                     phase2_loss=phase2_loss)
+        val_loss   = validate(model, val_loader, device, metric=val_metric)
 
-        scheduler.step(val_crps)
+        scheduler.step(val_loss)
 
         history["train_loss"].append(train_loss)
-        history["val_crps"].append(val_crps)
+        history["val_crps"].append(val_loss)
 
-        improved = val_crps < best_val_crps
+        improved = val_loss < best_val
         if improved:
-            best_val_crps = val_crps
+            best_val = val_loss
             epochs_without_improvement = 0
             torch.save(model.state_dict(), weights_path)
             marker = " *"
@@ -807,8 +815,8 @@ def train(model, train_loader, val_loader, device, weights_path,
 
         print(
             f"Epoch {epoch:03d}/{n_epochs} | "
-            f"Train CRPS: {train_loss:.4f} | "
-            f"Val CRPS: {val_crps:.4f} | "
+            f"Train {phase2_loss.upper()}: {train_loss:.4f} | "
+            f"Val {phase2_loss.upper()}: {val_loss:.4f} | "
             f"TF: {tf_ratio:.2f}"
             f"{marker}"
         )
@@ -818,7 +826,7 @@ def train(model, train_loader, val_loader, device, weights_path,
                   f"(no improvement for {PATIENCE} epochs)")
             break
 
-    print(f"\n[TRAIN] Done. Best val CRPS: {best_val_crps:.4f} — weights saved to {weights_path}")
+    print(f"\n[TRAIN] Done. Best val {phase2_loss.upper()}: {best_val:.4f} — weights saved to {weights_path}")
     return history
 
 
@@ -840,7 +848,74 @@ def train(model, train_loader, val_loader, device, weights_path,
 
 
 # =============================================================================
-# SECTION 8: MAIN
+# SECTION 8: ABLATION STUDY
+# =============================================================================
+
+_ABLATION_NORMAL = {
+    "name":            "normal",
+    "num_layers":      2,
+    "hidden_size":     128,
+    "dropout":         0.3,
+    "phase2_loss":     "crps",
+    "pretrain_epochs": PRETRAIN_EPOCHS,
+}
+
+ABLATION_CONFIGS = [
+    _ABLATION_NORMAL,
+    {**_ABLATION_NORMAL, "name": "1-layer",    "num_layers":      1},
+    {**_ABLATION_NORMAL, "name": "hidden-64",  "hidden_size":     64},
+    {**_ABLATION_NORMAL, "name": "nll-loss",   "phase2_loss":     "nll"},
+    {**_ABLATION_NORMAL, "name": "1-phase",    "pretrain_epochs": 0},
+    {**_ABLATION_NORMAL, "name": "no-dropout", "dropout":         0.0},
+]
+
+ABLATIONS_DIR = os.path.join(MODELS_DIR, "ablations")
+
+
+def run_ablations(train_loader, val_loader):
+    """
+    Train each config in ABLATION_CONFIGS and save weights to
+    models/ablations/<name>/best_model.pt. No evaluation is done here —
+    run test.py --mode ablation to evaluate the saved checkpoints.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n[ABLATE] Device: {device}")
+    print(f"[ABLATE] Training {len(ABLATION_CONFIGS)} configurations\n")
+
+    for cfg in ABLATION_CONFIGS:
+        set_seed()
+
+        model = ProbabilisticForecaster(
+            hidden_size=cfg["hidden_size"],
+            num_layers=cfg["num_layers"],
+            dropout=cfg["dropout"],
+        )
+        model.to(device)
+
+        cfg_dir      = os.path.join(ABLATIONS_DIR, cfg["name"])
+        os.makedirs(cfg_dir, exist_ok=True)
+        weights_path = os.path.join(cfg_dir, "best_model.pt")
+
+        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\n{'='*60}")
+        print(f"  Ablation: {cfg['name']}  ({num_params:,} params)")
+        print(f"  layers={cfg['num_layers']}  hidden={cfg['hidden_size']}  "
+              f"dropout={cfg['dropout']}  loss={cfg['phase2_loss']}  "
+              f"pretrain={cfg['pretrain_epochs']} epochs")
+        print(f"{'='*60}")
+
+        train(
+            model, train_loader, val_loader, device, weights_path,
+            n_epochs=EPOCHS,
+            pretrain_epochs=cfg["pretrain_epochs"],
+            phase2_loss=cfg["phase2_loss"],
+        )
+
+    print(f"\n[ABLATE] All weights saved under {ABLATIONS_DIR}/")
+
+
+# =============================================================================
+# SECTION 9: MAIN
 # =============================================================================
 
 def main(max_records=None, n_epochs=EPOCHS):
@@ -922,6 +997,16 @@ def main(max_records=None, n_epochs=EPOCHS):
     print("\n[DONE]")
 
 
+RUN_ABLATIONS = False  # set to True to train all ablation configs instead of a single run
+
 if __name__ == "__main__":
-    # For a quick subset test use: main(max_records=500, n_epochs=20)
-    main()
+    if RUN_ABLATIONS:
+        download_era5()
+        preprocess_hourly_to_daily()
+        dates, features = load_daily_data()
+        train_data, val_data, _, _, _ = split_and_normalise(dates, features)
+        train_loader, val_loader, _ = create_dataloaders(train_data, val_data, val_data)
+        run_ablations(train_loader, val_loader)
+    else:
+        # For a quick subset test use: main(max_records=500, n_epochs=20)
+        main()

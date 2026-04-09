@@ -1776,12 +1776,139 @@ def real_data_test(output_dir: str = DEFAULT_OUTPUT_DIR):
     print("\nReal data test complete.")
 
 
+def ablation_test():
+    """
+    Load each ablation checkpoint saved by train.py (RUN_ABLATIONS=True),
+    run inference on the test split, and print a comparison table.
+    Results are written to results/ablation_summary.txt.
+    """
+    _require_torch()
+    from train import (
+        ABLATION_CONFIGS,
+        ABLATIONS_DIR,
+        ProbabilisticForecaster,
+        TARGET_FEATURE_INDICES,
+        WeatherWindowDataset,
+        load_daily_data,
+        split_and_normalise,
+    )
+
+    stats_path  = os.path.join(MODELS_DIR, "normalisation_stats.pt")
+    config_path = os.path.join(MODELS_DIR, "split_config.pt")
+    for p in (stats_path, config_path):
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"{p} not found — run train.py first.")
+
+    stats       = torch.load(stats_path,  map_location="cpu", weights_only=False)
+    config      = torch.load(config_path, map_location="cpu", weights_only=False)
+    train_mean  = stats["mean"]
+    train_std   = stats["std"]
+    max_records = config["max_records"]
+    split_fracs = config["split_fracs"]
+
+    # Reconstruct the same test split used during training
+    dates, features = load_daily_data(max_records=max_records)
+    n = len(features)
+    if split_fracs is not None:
+        n_train = int(n * split_fracs[0])
+        n_val   = int(n * split_fracs[1])
+        test_features = features[n_train + n_val:]
+    else:
+        from train import VAL_END_YEAR
+        test_features = features[[i for i, d in enumerate(dates) if int(d[:4]) > VAL_END_YEAR]]
+
+    test_data    = (test_features - train_mean) / train_std
+    test_dataset = WeatherWindowDataset(test_data)
+    test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[ABLATE EVAL] Device: {device}\n")
+
+    # Model head order → eval order: [temp, hum, rain, wind] → [temp, rain, hum, wind]
+    MODEL_TO_EVAL = [0, 2, 1, 3]
+
+    results = []
+    for cfg in ABLATION_CONFIGS:
+        weights_path = os.path.join(ABLATIONS_DIR, cfg["name"], "best_model.pt")
+        if not os.path.exists(weights_path):
+            print(f"  [SKIP] {cfg['name']} — weights not found at {weights_path}")
+            continue
+
+        model = ProbabilisticForecaster(
+            hidden_size=cfg["hidden_size"],
+            num_layers=cfg["num_layers"],
+            dropout=cfg["dropout"],
+        )
+        model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+        model.to(device)
+        model.eval()
+
+        all_mu, all_sigma, all_y = [], [], []
+        with torch.no_grad():
+            for x, y in test_loader:
+                mu, sigma = model(x.to(device))
+                all_mu.append(mu.cpu())
+                all_sigma.append(sigma.cpu())
+                all_y.append(y.cpu())
+
+        mu_norm    = torch.cat(all_mu,    dim=0)
+        sigma_norm = torch.cat(all_sigma, dim=0)
+        y_norm     = torch.cat(all_y,     dim=0)
+
+        # Denormalise and remap to eval variable order
+        t_mean  = train_mean[TARGET_FEATURE_INDICES]
+        t_std   = train_std[TARGET_FEATURE_INDICES]
+        mu_r    = (mu_norm    * t_std + t_mean).numpy()[..., MODEL_TO_EVAL]
+        sigma_r = (sigma_norm * t_std          ).numpy()[..., MODEL_TO_EVAL]
+        y_r     = (y_norm     * t_std + t_mean).numpy()[..., MODEL_TO_EVAL]
+
+        mu_t    = torch.from_numpy(mu_r)
+        sigma_t = torch.from_numpy(sigma_r)
+        y_t     = torch.from_numpy(y_r)
+
+        test_crps = crps_gaussian(mu_t, sigma_t, y_t).item()
+        test_nll  = gaussian_nll(mu_t, sigma_t, y_t).item()
+        cov       = empirical_coverage(mu_t, sigma_t, y_t, [0.5, 0.9])
+
+        results.append({
+            "name":      cfg["name"],
+            "test_crps": test_crps,
+            "test_nll":  test_nll,
+            "cov_50":    cov[0.5],
+            "cov_90":    cov[0.9],
+        })
+
+    # Print and save comparison table
+    header = f"{'Config':<14} {'CRPS':>7} {'NLL':>7} {'Cov50%':>8} {'Cov90%':>8}"
+    sep    = "-" * len(header)
+    lines  = ["ABLATION RESULTS", header, sep]
+    for r in results:
+        marker = " <-- normal model" if r["name"] == "normal" else ""
+        lines.append(
+            f"{r['name']:<14} "
+            f"{r['test_crps']:>7.4f} "
+            f"{r['test_nll']:>7.4f} "
+            f"{r['cov_50']*100:>7.1f}% "
+            f"{r['cov_90']*100:>7.1f}%"
+            f"{marker}"
+        )
+    lines.append(sep)
+
+    print("\n" + "\n".join(lines))
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    summary_path = os.path.join(RESULTS_DIR, "ablation_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\nAblation summary saved -> {summary_path}")
+
+
 def main():
     """CLI entrypoint for merged evaluation workflows."""
     parser = argparse.ArgumentParser(description="Run merged forecast evaluation workflows.")
     parser.add_argument(
         "--mode",
-        choices=["real", "dummy", "synthetic-eval", "all"],
+        choices=["real", "dummy", "synthetic-eval", "ablation", "all"],
         default="real",
         help="Which evaluation flow to run.",
     )
@@ -1791,6 +1918,8 @@ def main():
         dummy_data_test()
     elif args.mode == "synthetic-eval":
         synthetic_evaluation_demo()
+    elif args.mode == "ablation":
+        ablation_test()
     elif args.mode == "all":
         synthetic_evaluation_demo()
         dummy_data_test()
