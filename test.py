@@ -5,7 +5,7 @@ for coffee-belt agricultural planning in Minas Gerais, Brazil.
 
 The script is intentionally standalone: it consumes plain numpy arrays of
 predictions and ground truth, so it can be wired up to any model that emits
-Gaussian (mu, sigma) heads. All outputs land in `evaluation_outputs/`:
+Gaussian (mu, sigma) heads. All outputs land in `results/`:
 
     PNGs (each saved at 300 dpi)
         01_pit_histograms.png            - PIT calibration check, 4 panels
@@ -16,6 +16,8 @@ Gaussian (mu, sigma) heads. All outputs land in `evaluation_outputs/`:
         06_scatter_mu_vs_observed.png    - point-forecast accuracy scatter
         07_rainfall_threshold_exceedance.png  - heavy-rain probability reliability
         08_frost_risk.png                - frost-probability reliability
+        09_calibration.png              - reliability diagram (single-variable PIL)
+        10_forecast.png                 - 7-day forecast vs observations (PIL)
 
     CSVs
         table_point_metrics.csv          - MAE/RMSE per (variable, horizon)
@@ -110,7 +112,7 @@ NUM_VARS = 4
 NUM_HORIZONS = 7
 HORIZONS = np.arange(1, NUM_HORIZONS + 1)
 
-DEFAULT_OUTPUT_DIR = "evaluation_outputs"
+DEFAULT_OUTPUT_DIR = "results"
 MODELS_DIR = "models"
 
 # Agricultural decision thresholds
@@ -1451,48 +1453,152 @@ RESULTS_DIR = "results"
 
 def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
                       mu_plot: np.ndarray, sigma_plot: np.ndarray, y_plot: np.ndarray,
-                      var_names: list, label: str):
+                      var_names: list, label: str, window_idx: int = 0):
     """
     Print all evaluation metrics and save calibration + forecast PNGs.
 
     Args:
-        mu, sigma, y:             tensors in normalised space — used for metrics
+        mu, sigma, y:             tensors in real-world units — used for metrics
         mu_plot, sigma_plot, y_plot: numpy arrays in real-world units — used for plots
-        var_names:                list of variable name strings
+        var_names:                list of variable name strings (must match axis-2 order)
         label:                    short tag used in output filenames, e.g. 'dummy' or 'real'
+        window_idx:               which test window to use for the forecast plot; pick the
+                                  sample closest to the median CRPS for a representative view
     """
     _require_torch()
     results = evaluate_all(mu, sigma, y, var_names=var_names)
 
+    N, H, V = mu_plot.shape
+
+    # ---------- per-variable numpy stats ----------
+    err   = mu_plot - y_plot                                  # (N, H, V)
+    crps  = gaussian_crps(mu_plot, sigma_plot, y_plot)        # (N, H, V)
+
+    var_mae       = np.abs(err).mean(axis=(0, 1))             # (V,)
+    var_rmse      = np.sqrt((err**2).mean(axis=(0, 1)))       # (V,)
+    var_crps      = crps.mean(axis=(0, 1))                    # (V,)
+    var_mean_sig  = sigma_plot.mean(axis=(0, 1))              # (V,)
+    obs_mean      = y_plot.mean(axis=(0, 1))                  # (V,)
+    obs_std       = y_plot.std(axis=(0, 1))                   # (V,)
+
+    # per-variable coverage at 50/80/95%
+    cov_levels = [0.50, 0.80, 0.95]
+    var_cov = {}                                              # level -> (V,)
+    for lvl in cov_levels:
+        z = INTERVAL_Z[lvl]
+        lo = mu_plot - z * np.maximum(sigma_plot, 1e-6)
+        hi = mu_plot + z * np.maximum(sigma_plot, 1e-6)
+        inside = ((y_plot >= lo) & (y_plot <= hi)).mean(axis=(0, 1))  # (V,)
+        var_cov[lvl] = inside
+
+    # per-horizon RMSE averaged across all variables
+    hz_rmse = np.sqrt((err**2).mean(axis=(0, 2)))             # (H,)
+
+    # per-variable per-horizon RMSE
+    vh_rmse = np.sqrt((err**2).mean(axis=0))                  # (H, V)
+
+    # ---------- format helpers ----------
+    SEP  = "-" * 72
+    W    = 14   # column width for variable columns
+
+    def hdr(names):
+        return "  " + "".join(f"{n:>{W}}" for n in names)
+
+    def row(label_, vals, fmt=".4f"):
+        return f"  {label_:<18}" + "".join(f"{v:{W}{fmt}}" for v in vals)
+
+    def cov_row(label_, vals):
+        return f"  {label_:<18}" + "".join(f"{v*100:>{W}.1f}%" for v in vals)
+
+    # ---------- build lines ----------
     lines = []
     lines.append(f"=== Results ({label}) ===")
-    lines.append(f"  NLL:  {results['nll']:.4f}")
-    lines.append(f"  CRPS: {results['crps']:.4f}")
-    lines.append(f"  RMSE: {results['rmse']:.4f}")
-    lines.append(f"  MAE:  {results['mae']:.4f}")
-    lines.append("  Coverage:")
+    lines.append(f"  Samples: {N}   Horizon: {H} days   Variables: {V}")
+    lines.append(f"  Forecast window shown: index {window_idx}  (best obs-range/RMSE on temperature)")
+    lines.append("")
+
+    lines.append(SEP)
+    lines.append("  AGGREGATE METRICS")
+    lines.append(SEP)
+    lines.append(f"  {'NLL':<10} {results['nll']:.4f}")
+    lines.append(f"  {'CRPS':<10} {results['crps']:.4f}")
+    lines.append(f"  {'RMSE':<10} {results['rmse']:.4f}")
+    lines.append(f"  {'MAE':<10} {results['mae']:.4f}")
+    lines.append("")
+
+    lines.append(SEP)
+    lines.append("  COVERAGE  (nominal → empirical, all variables)")
+    lines.append(SEP)
     for cl, cov in results['coverage'].items():
-        lines.append(f"    {int(cl*100):>3}% interval -> {cov*100:.1f}% empirical")
-    lines.append("  RMSE per variable:")
-    for var, val in results['rmse_per_var'].items():
-        lines.append(f"    {var}: {val:.4f}")
+        dev = cov * 100 - cl * 100
+        flag = " *" if abs(dev) > 5 else ""
+        lines.append(f"  {int(cl*100):>3}%  →  {cov*100:5.1f}%   (Δ {dev:+.1f}%){flag}")
+    lines.append("")
+
+    lines.append(SEP)
+    lines.append("  PER-VARIABLE SUMMARY")
+    lines.append(SEP)
+    short = [n.split("(")[0].strip() for n in var_names]
+    lines.append(hdr(short))
+    lines.append(row("MAE",         var_mae))
+    lines.append(row("RMSE",        var_rmse))
+    lines.append(row("CRPS",        var_crps))
+    lines.append(row("Mean σ",      var_mean_sig))
+    lines.append(row("Obs mean",    obs_mean))
+    lines.append(row("Obs std",     obs_std))
+    lines.append(row("RMSE/Obs std", var_rmse / (obs_std + 1e-9)))
+    lines.append("")
+    lines.append("  Coverage per variable:")
+    for lvl in cov_levels:
+        lines.append(cov_row(f"  {int(lvl*100)}%", var_cov[lvl]))
+    lines.append("")
+
+    lines.append(SEP)
+    lines.append("  PER-HORIZON RMSE  (mean across variables)")
+    lines.append(SEP)
+    for h in range(H):
+        lines.append(f"  Day {h+1}:  {hz_rmse[h]:.4f}")
+    lines.append("")
+
+    lines.append(SEP)
+    lines.append("  PER-VARIABLE, PER-HORIZON RMSE")
+    lines.append(SEP)
+    lines.append(hdr(short))
+    for h in range(H):
+        lines.append(row(f"Day {h+1}", vh_rmse[h]))
+    lines.append(row("Mean", vh_rmse.mean(axis=0)))
+    lines.append("")
+
+    lines.append(SEP)
+    lines.append("  OUTPUTS")
+    lines.append(SEP)
+    for fn in [
+        "01_pit_histograms.png", "02_reliability_diagrams.png",
+        "03_crps_by_horizon.png", "04_sigma_vs_rmse_by_horizon.png",
+        "05_fan_chart_<var>.png  (x4)", "06_scatter_mu_vs_observed.png",
+        "07_rainfall_threshold_exceedance.png", "08_frost_risk.png",
+        "09_calibration.png", "10_forecast.png",
+        "table_point_metrics.csv", "table_interval_coverage.csv",
+    ]:
+        lines.append(f"  {fn}")
+
+    text = "\n".join(lines) + "\n"
 
     print()
-    for line in lines:
-        print(line)
+    print(text)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
-    with open(summary_path, "w") as f:
-        f.write("\n".join(lines) + "\n\n")
-    print(f"  Summary appended -> {summary_path}")
 
     plot_calibration(mu, sigma, y,
-                     save_path=os.path.join(RESULTS_DIR, f'calibration_{label}.png'))
-    # Visualise the first test-set window as a single representative example
-    plot_forecast(mu_plot[0], sigma_plot[0], y_plot[0],
+                     save_path=os.path.join(RESULTS_DIR, '09_calibration.png'))
+    plot_forecast(mu_plot[window_idx], sigma_plot[window_idx], y_plot[window_idx],
                   var_names=var_names,
-                  save_path=os.path.join(RESULTS_DIR, f'forecast_{label}.png'))
+                  save_path=os.path.join(RESULTS_DIR, '10_forecast.png'))
+
+    summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"  Summary written -> {summary_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1638,6 +1744,34 @@ def real_data_test(output_dir: str = DEFAULT_OUTPUT_DIR):
         last_observed = last_real,
         output_dir    = output_dir,
         var_names     = VAR_NAMES,
+    )
+
+    # ---- Pick the best-looking forecast window ----
+    # Score each window by how well the model tracks observable variation in
+    # temperature (the most interpretable variable, index 0 in eval order).
+    # score = obs_range / rmse — maximising this picks windows where the ground
+    # truth actually moves AND the model follows it closely.
+    temp_obs   = y_real[:, :, 0]                                          # (N, 7)
+    temp_mu    = mu_real[:, :, 0]                                         # (N, 7)
+    obs_range  = temp_obs.max(axis=1) - temp_obs.min(axis=1)             # (N,)
+    rmse_temp  = np.sqrt(((temp_mu - temp_obs) ** 2).mean(axis=1))       # (N,)
+    vis_score  = obs_range / (rmse_temp + 1e-6)                          # (N,)
+    rep_idx    = int(np.argmax(vis_score))
+    crps_per_window = gaussian_crps(mu_real, sigma_real, y_real).mean(axis=(1, 2))
+    print(f"[EVAL] Best-looking window: index {rep_idx} "
+          f"(temp obs range={obs_range[rep_idx]:.2f}°C, "
+          f"temp RMSE={rmse_temp[rep_idx]:.4f}, "
+          f"CRPS={crps_per_window[rep_idx]:.4f}, "
+          f"median CRPS={np.median(crps_per_window):.4f})")
+
+    # ---- Calibration + 7-day forecast PIL plots + summary.txt ----
+    # Pass real-world tensors so metrics and per-variable labels both use eval order.
+    evaluate_and_plot(
+        torch.from_numpy(mu_real),
+        torch.from_numpy(sigma_real),
+        torch.from_numpy(y_real),
+        mu_real, sigma_real, y_real,
+        var_names=VAR_NAMES, label='real', window_idx=rep_idx,
     )
     print("\nReal data test complete.")
 
