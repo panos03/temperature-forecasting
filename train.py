@@ -994,19 +994,12 @@ def main(max_records=None, n_epochs=EPOCHS):
     torch.save({"max_records": max_records, "split_fracs": split_fracs}, config_path)
     print(f"[EVAL] Split config saved to {config_path}")
 
+    # --- Step 9: Ablation study ---
+    run_ablations(train_loader, val_loader)
+
     print("\n[DONE]")
 
 
-RUN_ABLATIONS = False  # set to True to train all ablation configs instead of a single run
-
 if __name__ == "__main__":
-    if RUN_ABLATIONS:
-        download_era5()
-        preprocess_hourly_to_daily()
-        dates, features = load_daily_data()
-        train_data, val_data, _, _, _ = split_and_normalise(dates, features)
-        train_loader, val_loader, _ = create_dataloaders(train_data, val_data, val_data)
-        run_ablations(train_loader, val_loader)
-    else:
-        # For a quick subset test use: main(max_records=500, n_epochs=20)
-        main()
+    # For a quick subset test use: main(max_records=500, n_epochs=20)
+    main()
