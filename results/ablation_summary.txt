@@ -1,4 +1,14 @@
 ABLATION RESULTS
-Config            CRPS     NLL   Cov50%   Cov90%
-------------------------------------------------
-------------------------------------------------
+Overall CRPS: mean across all 4 variables (mixed units — use for run comparison only)
+Overall CRPSS: skill vs climatology (0=no better than always predicting training mean, 1=perfect)
+Per-variable CRPS units: Temp=°C  Rain=mm  Hum=%  Wind=m/s
+Per-variable CRPSS: dimensionless — comparable across variables
+
+Config            CRPS   CRPSS     NLL   Cov50%   Cov90%   Temp CRPS   Rain CRPS    Hum CRPS   Wind CRPS   Temp CRPSS   Rain CRPSS    Hum CRPSS   Wind CRPSS
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+1-layer         1.9485  0.3183  2.6581    52.7%    88.4%      0.9365      2.1871      4.3486      0.3219       0.4266       0.3059       0.3092       0.0903
+hidden-64       1.9432  0.3202  2.9867    47.5%    83.4%      0.9423      2.1602      4.3486      0.3218       0.4231       0.3145       0.3092       0.0907
+nll-loss        1.9919  0.3031  2.2212    57.0%    91.2%      0.9063      2.4359      4.3028      0.3226       0.4451       0.2270       0.3165       0.0884
+1-phase         1.9288  0.3252  2.9037    51.7%    87.7%      0.9162      2.1631      4.3140      0.3217       0.4390       0.3136       0.3147       0.0909
+no-dropout      1.9380  0.3220  3.0229    48.4%    84.1%      0.9241      2.1639      4.3427      0.3215       0.4342       0.3133       0.3101       0.0915
+------------------------------------------------------------------------------------------------------------------------------------------------------------

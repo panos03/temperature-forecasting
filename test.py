@@ -900,6 +900,24 @@ def crps_gaussian(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor) -> tor
     return crps.mean()
 
 
+def crps_skill_score(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
+                     clim_mu: torch.Tensor, clim_sigma: torch.Tensor) -> torch.Tensor:
+    """
+    CRPSS = 1 - CRPS_model / CRPS_climatology
+
+    Climatology forecast: always predict the training-set mean and std,
+    ignoring the input window entirely.
+
+    Interpretation:
+        1.0  = perfect
+        0.0  = no better than climatology
+        <0.0 = worse than climatology
+    """
+    model_crps = crps_gaussian(mu, sigma, y)
+    clim_crps  = crps_gaussian(clim_mu.expand_as(mu), clim_sigma.expand_as(sigma), y)
+    return 1.0 - model_crps / clim_crps
+
+
 # ---------------------------------------------------------------------------
 # RMSE and MAE (on predicted means only)
 # ---------------------------------------------------------------------------
@@ -1400,7 +1418,8 @@ RESULTS_DIR = "results"
 
 def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
                       mu_plot: np.ndarray, sigma_plot: np.ndarray, y_plot: np.ndarray,
-                      var_names: list, label: str, window_idx: int = 0):
+                      var_names: list, label: str, window_idx: int = 0,
+                      clim_mu: torch.Tensor = None, clim_sigma: torch.Tensor = None):
     """
     Print all evaluation metrics and save calibration + forecast PNGs.
 
@@ -1411,11 +1430,25 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
         label:                    short tag used in output filenames, e.g. 'dummy' or 'real'
         window_idx:               which test window to use for the forecast plot; pick the
                                   sample closest to the median CRPS for a representative view
+        clim_mu, clim_sigma:      (1, 1, V) tensors of training-set mean/std for CRPSS;
+                                  if None, CRPSS is not reported
     """
     _require_torch()
     results = evaluate_all(mu, sigma, y, var_names=var_names)
 
     N, H, V = mu_plot.shape
+
+    # ---------- CRPS skill score ----------
+    if clim_mu is not None and clim_sigma is not None:
+        overall_crpss = crps_skill_score(mu, sigma, y, clim_mu, clim_sigma).item()
+        crpss_per_var = [
+            crps_skill_score(mu[..., i:i+1], sigma[..., i:i+1], y[..., i:i+1],
+                             clim_mu[..., i:i+1], clim_sigma[..., i:i+1]).item()
+            for i in range(mu.shape[-1])
+        ]
+    else:
+        overall_crpss  = None
+        crpss_per_var  = None
 
     # ---------- per-variable numpy stats ----------
     err   = mu_plot - y_plot                                  # (N, H, V)
@@ -1466,9 +1499,17 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
 
     lines.append(SEP)
     lines.append("  AGGREGATE METRICS")
+    lines.append("  CRPS/RMSE/MAE are averaged across all 4 variables (mixed units — use for run comparison only)")
+    lines.append("  CRPSS = 1 - CRPS_model/CRPS_climatology  (0=no better than climatology, 1=perfect)")
     lines.append(SEP)
+    if overall_crpss is not None:
+        clim_crps_overall = results['crps'] / (1 - overall_crpss) if overall_crpss < 1 else float('inf')
+        lines.append(f"  {'':20} {'Model':>10}  {'Climatology':>12}")
+        lines.append(f"  {'CRPS':<20} {results['crps']:>10.4f}  {clim_crps_overall:>12.4f}")
+        lines.append(f"  {'CRPSS':<20} {overall_crpss:>10.4f}  {'0.0000':>12}")
+    else:
+        lines.append(f"  {'CRPS':<10} {results['crps']:.4f}")
     lines.append(f"  {'NLL':<10} {results['nll']:.4f}")
-    lines.append(f"  {'CRPS':<10} {results['crps']:.4f}")
     lines.append(f"  {'RMSE':<10} {results['rmse']:.4f}")
     lines.append(f"  {'MAE':<10} {results['mae']:.4f}")
     lines.append("")
@@ -1484,12 +1525,21 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
 
     lines.append(SEP)
     lines.append("  PER-VARIABLE SUMMARY")
+    lines.append("  CRPS/RMSE/MAE are in real-world units: Temp=°C  Rain=mm  Hum=%  Wind=m/s")
+    lines.append("  CRPS ≈ MAE for a perfect point forecast; lower is better")
     lines.append(SEP)
     short = [n.split("(")[0].strip() for n in var_names]
     lines.append(hdr(short))
-    lines.append(row("MAE",         var_mae))
-    lines.append(row("RMSE",        var_rmse))
-    lines.append(row("CRPS",        var_crps))
+    lines.append(row("MAE",          var_mae))
+    lines.append(row("RMSE",         var_rmse))
+    lines.append(row("CRPS (model)",  var_crps))
+    if crpss_per_var is not None:
+        clim_crps_per_var = [
+            var_crps[i] / (1 - crpss_per_var[i]) if crpss_per_var[i] < 1 else float('inf')
+            for i in range(len(var_crps))
+        ]
+        lines.append(row("CRPS (clim)", clim_crps_per_var))
+        lines.append(row("CRPSS",       crpss_per_var))
     lines.append(row("Mean σ",      var_mean_sig))
     lines.append(row("Obs mean",    obs_mean))
     lines.append(row("Obs std",     obs_std))
@@ -1679,6 +1729,12 @@ def real_data_test(output_dir: str = DEFAULT_OUTPUT_DIR):
           f"CRPS={crps_per_window[rep_idx]:.4f}, "
           f"median CRPS={np.median(crps_per_window):.4f})")
 
+    # ---- Build climatology tensors for CRPSS (training-set mean/std, eval order) ----
+    t_mean_eval  = t_mean[MODEL_TO_EVAL]   # (4,) in eval order
+    t_std_eval   = t_std[MODEL_TO_EVAL]
+    clim_mu      = torch.tensor(t_mean_eval, dtype=torch.float32).view(1, 1, -1)
+    clim_sigma   = torch.tensor(t_std_eval,  dtype=torch.float32).view(1, 1, -1)
+
     # ---- Calibration + 7-day forecast PIL plots + summary.txt ----
     # Pass real-world tensors so metrics and per-variable labels both use eval order.
     evaluate_and_plot(
@@ -1687,6 +1743,7 @@ def real_data_test(output_dir: str = DEFAULT_OUTPUT_DIR):
         torch.from_numpy(y_real),
         mu_real, sigma_real, y_real,
         var_names=VAR_NAMES, label='real', window_idx=rep_idx,
+        clim_mu=clim_mu, clim_sigma=clim_sigma,
     )
     print("\nReal data test complete.")
 
@@ -1741,6 +1798,12 @@ def ablation_test():
     # Model head order → eval order: [temp, hum, rain, wind] → [temp, rain, hum, wind]
     MODEL_TO_EVAL = [0, 2, 1, 3]
 
+    # Climatology tensors for CRPSS (training-set mean/std in eval order)
+    t_mean_eval = train_mean[TARGET_FEATURE_INDICES][MODEL_TO_EVAL]
+    t_std_eval  = train_std[TARGET_FEATURE_INDICES][MODEL_TO_EVAL]
+    clim_mu     = torch.tensor(t_mean_eval, dtype=torch.float32).view(1, 1, -1)
+    clim_sigma  = torch.tensor(t_std_eval,  dtype=torch.float32).view(1, 1, -1)
+
     results = []
     for cfg in ABLATION_CONFIGS:
         weights_path = os.path.join(ABLATIONS_DIR, cfg["filename"])
@@ -1780,29 +1843,60 @@ def ablation_test():
         sigma_t = torch.from_numpy(sigma_r)
         y_t     = torch.from_numpy(y_r)
 
-        test_crps = crps_gaussian(mu_t, sigma_t, y_t).item()
-        test_nll  = gaussian_nll(mu_t, sigma_t, y_t).item()
-        cov       = empirical_coverage(mu_t, sigma_t, y_t, [0.5, 0.9])
+        test_crps    = crps_gaussian(mu_t, sigma_t, y_t).item()
+        test_nll     = gaussian_nll(mu_t, sigma_t, y_t).item()
+        cov          = empirical_coverage(mu_t, sigma_t, y_t, [0.5, 0.9])
+        overall_crpss = crps_skill_score(mu_t, sigma_t, y_t, clim_mu, clim_sigma).item()
+        crps_per_var = [
+            float(crps_gaussian(mu_t[..., i:i+1], sigma_t[..., i:i+1], y_t[..., i:i+1]))
+            for i in range(mu_t.shape[-1])
+        ]
+        crpss_per_var = [
+            crps_skill_score(mu_t[..., i:i+1], sigma_t[..., i:i+1], y_t[..., i:i+1],
+                             clim_mu[..., i:i+1], clim_sigma[..., i:i+1]).item()
+            for i in range(mu_t.shape[-1])
+        ]
 
         results.append({
-            "name":      cfg["name"],
-            "test_crps": test_crps,
-            "test_nll":  test_nll,
-            "cov_50":    cov[0.5],
-            "cov_90":    cov[0.9],
+            "name":          cfg["name"],
+            "test_crps":     test_crps,
+            "overall_crpss": overall_crpss,
+            "test_nll":      test_nll,
+            "cov_50":        cov[0.5],
+            "cov_90":        cov[0.9],
+            "crps_per_var":  crps_per_var,
+            "crpss_per_var": crpss_per_var,
         })
 
     # Print and save comparison table
-    header = f"{'Config':<14} {'CRPS':>7} {'NLL':>7} {'Cov50%':>8} {'Cov90%':>8}"
-    sep    = "-" * len(header)
-    lines  = ["ABLATION RESULTS", header, sep]
+    var_short = ["Temp", "Rain", "Hum", "Wind"]
+    var_units = ["°C",   "mm",   "%",   "m/s"]
+    crps_header  = "".join(f"  {v+' CRPS':>10}" for v in var_short)
+    crpss_header = "".join(f"  {v+' CRPSS':>11}" for v in var_short)
+    header = (f"{'Config':<14} {'CRPS':>7} {'CRPSS':>7} {'NLL':>7} {'Cov50%':>8} {'Cov90%':>8}"
+              + crps_header + crpss_header)
+    sep   = "-" * len(header)
+    lines = [
+        "ABLATION RESULTS",
+        "Overall CRPS: mean across all 4 variables (mixed units — use for run comparison only)",
+        "Overall CRPSS: skill vs climatology (0=no better than always predicting training mean, 1=perfect)",
+        f"Per-variable CRPS units: " + "  ".join(f"{v}={u}" for v, u in zip(var_short, var_units)),
+        "Per-variable CRPSS: dimensionless — comparable across variables",
+        "",
+        header, sep,
+    ]
     for r in results:
+        crps_cols  = "".join(f"  {v:>10.4f}" for v in r["crps_per_var"])
+        crpss_cols = "".join(f"  {v:>11.4f}" for v in r["crpss_per_var"])
         lines.append(
             f"{r['name']:<14} "
             f"{r['test_crps']:>7.4f} "
+            f"{r['overall_crpss']:>7.4f} "
             f"{r['test_nll']:>7.4f} "
             f"{r['cov_50']*100:>7.1f}% "
             f"{r['cov_90']*100:>7.1f}%"
+            f"{crps_cols}"
+            f"{crpss_cols}"
         )
     lines.append(sep)
 

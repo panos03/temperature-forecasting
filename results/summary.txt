@@ -4,9 +4,13 @@
 
 ------------------------------------------------------------------------
   AGGREGATE METRICS
+  CRPS/RMSE/MAE are averaged across all 4 variables (mixed units — use for run comparison only)
+  CRPSS = 1 - CRPS_model/CRPS_climatology  (0=no better than climatology, 1=perfect)
 ------------------------------------------------------------------------
+                            Model   Climatology
+  CRPS                     1.9236        2.8583
+  CRPSS                    0.3270        0.0000
   NLL        2.8923
-  CRPS       1.9236
   RMSE       5.0075
   MAE        2.6393
 
@@ -20,11 +24,15 @@
 
 ------------------------------------------------------------------------
   PER-VARIABLE SUMMARY
+  CRPS/RMSE/MAE are in real-world units: Temp=°C  Rain=mm  Hum=%  Wind=m/s
+  CRPS ≈ MAE for a perfect point forecast; lower is better
 ------------------------------------------------------------------------
      Temperature      Rainfall      Humidity    Wind Speed
   MAE                       1.2598        2.8068        6.0333        0.4575
   RMSE                      1.6723        5.8867        7.9067        0.5784
-  CRPS                      0.9142        2.1614        4.2967        0.3221
+  CRPS (model)              0.9142        2.1614        4.2967        0.3221
+  CRPS (clim)               1.6332        3.1511        6.2950        0.3539
+  CRPSS                     0.4403        0.3141        0.3174        0.0898
   Mean σ                    1.2027        2.7039        6.6841        0.5778
   Obs mean                 21.1402        3.0472       70.4949        2.1493
   Obs std                   2.8706        6.4205       11.2152        0.6269
