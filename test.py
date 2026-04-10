@@ -1419,7 +1419,8 @@ RESULTS_DIR = "results"
 def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
                       mu_plot: np.ndarray, sigma_plot: np.ndarray, y_plot: np.ndarray,
                       var_names: list, label: str, window_idx: int = 0,
-                      clim_mu: torch.Tensor = None, clim_sigma: torch.Tensor = None):
+                      clim_mu: torch.Tensor = None, clim_sigma: torch.Tensor = None,
+                      last_observed_np: np.ndarray = None):
     """
     Print all evaluation metrics and save calibration + forecast PNGs.
 
@@ -1432,6 +1433,8 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
                                   sample closest to the median CRPS for a representative view
         clim_mu, clim_sigma:      (1, 1, V) tensors of training-set mean/std for CRPSS;
                                   if None, CRPSS is not reported
+        last_observed_np:         optional (n_samples, V) numpy array — last observed value
+                                  before each forecast window, used for persistence baseline
     """
     _require_torch()
     results = evaluate_all(mu, sigma, y, var_names=var_names)
@@ -1477,6 +1480,19 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
     # per-variable per-horizon RMSE
     vh_rmse = np.sqrt((err**2).mean(axis=0))                  # (H, V)
 
+    # ---------- point forecast baselines ----------
+    clim_pred_np = np.broadcast_to(y_plot.mean(axis=(0, 1)), y_plot.shape)
+    clim_mae  = np.abs(clim_pred_np - y_plot).mean(axis=(0, 1))   # (V,)
+    clim_rmse = np.sqrt(((clim_pred_np - y_plot) ** 2).mean(axis=(0, 1)))
+
+    if last_observed_np is not None:
+        pers_pred_np = np.broadcast_to(last_observed_np[:, None, :], y_plot.shape)
+    else:
+        pers_pred_np = np.broadcast_to(y_plot[:, :1, :], y_plot.shape)
+    pers_mae          = np.abs(pers_pred_np - y_plot).mean(axis=(0, 1))   # (V,)
+    pers_rmse         = np.sqrt(((pers_pred_np - y_plot) ** 2).mean(axis=(0, 1)))
+    pers_overall_crps = float(np.abs(pers_pred_np - y_plot).mean())
+
     # ---------- format helpers ----------
     SEP  = "-" * 72
     W    = 14   # column width for variable columns
@@ -1503,10 +1519,11 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
     lines.append("  CRPSS = 1 - CRPS_model/CRPS_climatology  (0=no better than climatology, 1=perfect)")
     lines.append(SEP)
     if overall_crpss is not None:
-        clim_crps_overall = results['crps'] / (1 - overall_crpss) if overall_crpss < 1 else float('inf')
-        lines.append(f"  {'':20} {'Model':>10}  {'Climatology':>12}")
-        lines.append(f"  {'CRPS':<20} {results['crps']:>10.4f}  {clim_crps_overall:>12.4f}")
-        lines.append(f"  {'CRPSS':<20} {overall_crpss:>10.4f}  {'0.0000':>12}")
+        clim_crps_overall  = results['crps'] / (1 - overall_crpss) if overall_crpss < 1 else float('inf')
+        pers_overall_crpss = 1.0 - pers_overall_crps / clim_crps_overall
+        lines.append(f"  {'':20} {'Model':>10}  {'Persistence':>12}  {'Deterministic':>14}  {'Climatology':>12}")
+        lines.append(f"  {'CRPS':<20} {results['crps']:>10.4f}  {pers_overall_crps:>12.4f}  {'N/A':>14}  {clim_crps_overall:>12.4f}")
+        lines.append(f"  {'CRPSS':<20} {overall_crpss:>10.4f}  {pers_overall_crpss:>12.4f}  {'N/A':>14}  {'0.0000':>12}")
     else:
         lines.append(f"  {'CRPS':<10} {results['crps']:.4f}")
     lines.append(f"  {'NLL':<10} {results['nll']:.4f}")
@@ -1551,6 +1568,20 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
     lines.append("")
 
     lines.append(SEP)
+    lines.append("  POINT FORECAST BASELINES  (mean over all 7 horizons)")
+    lines.append("  MAE and RMSE in real-world units: Temp=°C  Rain=mm  Hum=%  Wind=m/s")
+    lines.append("  Persistence = repeat last observed value; Climatology = training-set mean")
+    lines.append(SEP)
+    lines.append(hdr(short))
+    lines.append(row("Model     MAE",  var_mae))
+    lines.append(row("          RMSE", var_rmse))
+    lines.append(row("Persist.  MAE",  pers_mae))
+    lines.append(row("          RMSE", pers_rmse))
+    lines.append(row("Clim.     MAE",  clim_mae))
+    lines.append(row("          RMSE", clim_rmse))
+    lines.append("")
+
+    lines.append(SEP)
     lines.append("  PER-HORIZON RMSE  (mean across variables)")
     lines.append(SEP)
     for h in range(H):
@@ -1578,6 +1609,41 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
         "table_point_metrics.csv", "table_interval_coverage.csv",
     ]:
         lines.append(f"  {fn}")
+
+    # ---------- results table ----------
+    _clim_crps_ov = (results['crps'] / (1 - overall_crpss)
+                     if overall_crpss is not None and overall_crpss < 1
+                     else float('nan'))
+    _clim_crps_pv = (
+        [var_crps[i] / (1 - crpss_per_var[i]) if crpss_per_var[i] < 1 else float('inf')
+         for i in range(len(var_crps))]
+        if crpss_per_var is not None else [float('nan')] * len(var_crps)
+    )
+
+    def f3(v): return f"{v:.3f}"
+    C0, C1, C2, C3, C4, C5 = 26, 7, 10, 10, 8, 11  # col widths
+    th = (f"  {'Model':<{C0}} {'CRPS':>{C1}}  {'Temp (°C)':>{C2}}"
+          f"  {'Rain (mm)':>{C3}}  {'Hum (%)':>{C4}}  {'Wind (m/s)':>{C5}}")
+    tsep = "  " + "-" * (C0 + C1 + C2 + C3 + C4 + C5 + 10)
+
+    def trow(label, crps, pv):
+        return (f"  {label:<{C0}} {crps:>{C1}}  {pv[0]:>{C2}}"
+                f"  {pv[1]:>{C3}}  {pv[2]:>{C4}}  {pv[3]:>{C5}}")
+
+    lines.append("")
+    lines.append(SEP)
+    lines.append("  TABLE 1  (deterministic row filled in by ablation_test)")
+    lines.append("  CRPS in mixed units — per-variable: Temp=°C  Rain=mm  Hum=%  Wind=m/s")
+    lines.append(SEP)
+    lines.append(th)
+    lines.append(tsep)
+    lines.append(trow("Climatology baseline",  f3(_clim_crps_ov),    [f3(v) for v in _clim_crps_pv]))
+    lines.append(trow("Persistence baseline",  f3(pers_overall_crps), [f3(float(v)) for v in pers_mae]))
+    lines.append(trow("Deterministic baseline", "?????",              ["?????" for _ in range(4)]))
+    lines.append(tsep)
+    lines.append(trow("Full model",            f3(results['crps']),   [f3(float(v)) for v in var_crps]))
+    lines.append(tsep)
+    lines.append("")
 
     text = "\n".join(lines) + "\n"
 
@@ -1744,6 +1810,7 @@ def real_data_test(output_dir: str = DEFAULT_OUTPUT_DIR):
         mu_real, sigma_real, y_real,
         var_names=VAR_NAMES, label='real', window_idx=rep_idx,
         clim_mu=clim_mu, clim_sigma=clim_sigma,
+        last_observed_np=last_real,
     )
     print("\nReal data test complete.")
 
@@ -1895,7 +1962,11 @@ def ablation_test():
             "crpss_per_var": crpss_per_var,
         })
 
-    # Print and save comparison table
+    # Separate deterministic from ablation configs
+    det_results   = [r for r in results if r.get("deterministic", False)]
+    ablat_results = [r for r in results if not r.get("deterministic", False)]
+
+    # Print and save ablation comparison table (probabilistic configs only)
     var_short = ["Temp", "Rain", "Hum", "Wind"]
     var_units = ["°C",   "mm",   "%",   "m/s"]
     crps_header  = "".join(f"  {v+' CRPS':>10}" for v in var_short)
@@ -1909,44 +1980,77 @@ def ablation_test():
         "Overall CRPSS: skill vs climatology (0=no better than always predicting training mean, 1=perfect)",
         f"Per-variable CRPS units: " + "  ".join(f"{v}={u}" for v, u in zip(var_short, var_units)),
         "Per-variable CRPSS: dimensionless — comparable across variables",
-        "Deterministic baseline: CRPS = MAE (point-forecast CRPS); NLL and coverage are N/A",
         "",
         header, sep,
     ]
-    for r in results:
+    for r in ablat_results:
         crps_cols  = "".join(f"  {v:>10.4f}" for v in r["crps_per_var"])
         crpss_cols = "".join(f"  {v:>11.4f}" for v in r["crpss_per_var"])
-        if r.get("deterministic", False):
-            lines.append(
-                f"{r['name']:<14} "
-                f"{r['test_crps']:>7.4f} "
-                f"{r['overall_crpss']:>7.4f} "
-                f"{'N/A':>7} "
-                f"{'N/A':>8} "
-                f"{'N/A':>8}"
-                f"{crps_cols}"
-                f"{crpss_cols}"
-            )
-        else:
-            lines.append(
-                f"{r['name']:<14} "
-                f"{r['test_crps']:>7.4f} "
-                f"{r['overall_crpss']:>7.4f} "
-                f"{r['test_nll']:>7.4f} "
-                f"{r['cov_50']*100:>7.1f}% "
-                f"{r['cov_90']*100:>7.1f}%"
-                f"{crps_cols}"
-                f"{crpss_cols}"
-            )
+        lines.append(
+            f"{r['name']:<14} "
+            f"{r['test_crps']:>7.4f} "
+            f"{r['overall_crpss']:>7.4f} "
+            f"{r['test_nll']:>7.4f} "
+            f"{r['cov_50']*100:>7.1f}% "
+            f"{r['cov_90']*100:>7.1f}%"
+            f"{crps_cols}"
+            f"{crpss_cols}"
+        )
     lines.append(sep)
 
     print("\n" + "\n".join(lines))
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    summary_path = os.path.join(RESULTS_DIR, "ablation_summary.txt")
-    with open(summary_path, "w", encoding="utf-8") as f:
+    ablation_path = os.path.join(RESULTS_DIR, "ablation_summary.txt")
+    with open(ablation_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"\nAblation summary saved -> {summary_path}")
+    print(f"\nAblation summary saved -> {ablation_path}")
+
+    # Fill in deterministic placeholders in summary.txt
+    if det_results:
+        summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+        if os.path.exists(summary_path):
+            r0 = det_results[0]
+            with open(summary_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Aggregate table: N/A placeholders (CRPS row then CRPSS row)
+            na_placeholder = f"{'N/A':>14}"
+            content = content.replace(na_placeholder, f"{r0['test_crps']:>14.4f}", 1)
+            content = content.replace(na_placeholder, f"{r0['overall_crpss']:>14.4f}", 1)
+            # LaTeX table: ????? placeholders (overall CRPS, Temp, Rain, Hum, Wind)
+            for v in [r0['test_crps']] + r0['crps_per_var']:
+                content = content.replace("?????", f"{v:.3f}", 1)
+            with open(summary_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+    # Append deterministic baseline section to summary.txt
+    if det_results:
+        summary_path = os.path.join(RESULTS_DIR, "summary.txt")
+        SEP = "-" * 72
+        W = 14
+        short_hdr = "  " + "".join(f"{n:>{W}}" for n in var_short)
+        det_lines = [
+            "",
+            SEP,
+            "  DETERMINISTIC BASELINE  (point-forecast only, no uncertainty)",
+            "  CRPS = MAE for deterministic models; NLL and coverage are N/A",
+            SEP,
+        ]
+        for r in det_results:
+            det_lines.append(f"  {'CRPS (overall)':<20} {r['test_crps']:>10.4f}")
+            det_lines.append(f"  {'CRPSS (overall)':<20} {r['overall_crpss']:>10.4f}")
+            det_lines.append("")
+            det_lines.append(short_hdr)
+            det_lines.append(
+                f"  {'CRPS':<18}" + "".join(f"{v:{W}.4f}" for v in r["crps_per_var"])
+            )
+            det_lines.append(
+                f"  {'CRPSS':<18}" + "".join(f"{v:{W}.4f}" for v in r["crpss_per_var"])
+            )
+        det_lines.append("")
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(det_lines) + "\n")
+        print(f"Deterministic baseline appended -> {summary_path}")
 
 
 if __name__ == '__main__':

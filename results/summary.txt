@@ -7,9 +7,9 @@
   CRPS/RMSE/MAE are averaged across all 4 variables (mixed units — use for run comparison only)
   CRPSS = 1 - CRPS_model/CRPS_climatology  (0=no better than climatology, 1=perfect)
 ------------------------------------------------------------------------
-                            Model   Climatology
-  CRPS                     1.9236        2.8583
-  CRPSS                    0.3270        0.0000
+                            Model   Persistence   Deterministic   Climatology
+  CRPS                     1.9236        3.3878          2.6114        2.8583
+  CRPSS                    0.3270       -0.1852          0.0864        0.0000
   NLL        2.8923
   RMSE       5.0075
   MAE        2.6393
@@ -42,6 +42,19 @@
     50%                       41.0%          65.7%          47.0%          49.5%
     80%                       69.2%          86.8%          75.2%          81.3%
     95%                       87.6%          90.3%          92.0%          95.3%
+
+------------------------------------------------------------------------
+  POINT FORECAST BASELINES  (mean over all 7 horizons)
+  MAE and RMSE in real-world units: Temp=°C  Rain=mm  Hum=%  Wind=m/s
+  Persistence = repeat last observed value; Climatology = training-set mean
+------------------------------------------------------------------------
+     Temperature      Rainfall      Humidity    Wind Speed
+  Model     MAE             1.2598        2.8068        6.0333        0.4575
+            RMSE            1.6723        5.8867        7.9067        0.5784
+  Persist.  MAE             1.5816        3.7794        7.5713        0.6188
+            RMSE            2.1368        7.8786       10.1091        0.7882
+  Clim.     MAE             2.3202        4.0149        8.6880        0.5003
+            RMSE            2.8706        6.4205       11.2152        0.6269
 
 ------------------------------------------------------------------------
   PER-HORIZON RMSE  (mean across variables)
@@ -82,3 +95,29 @@
   10_forecast.png
   table_point_metrics.csv
   table_interval_coverage.csv
+
+------------------------------------------------------------------------
+  TABLE 1  (deterministic row filled in by ablation_test)
+  CRPS in mixed units — per-variable: Temp=°C  Rain=mm  Hum=%  Wind=m/s
+------------------------------------------------------------------------
+  Model                         CRPS   Temp (°C)   Rain (mm)   Hum (%)   Wind (m/s)
+  ----------------------------------------------------------------------------------
+  Climatology baseline         2.858       1.633       3.151     6.295        0.354
+  Persistence baseline         3.388       1.582       3.779     7.571        0.619
+  Deterministic baseline       2.611       1.266       2.670     6.056        0.453
+  ----------------------------------------------------------------------------------
+  Full model                   1.924       0.914       2.161     4.297        0.322
+  ----------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------
+  DETERMINISTIC BASELINE  (point-forecast only, no uncertainty)
+  CRPS = MAE for deterministic models; NLL and coverage are N/A
+------------------------------------------------------------------------
+  CRPS (overall)           2.6114
+  CRPSS (overall)          0.0864
+
+            Temp          Rain           Hum          Wind
+  CRPS                      1.2657        2.6703        6.0564        0.4532
+  CRPSS                     0.2251        0.1526        0.0379       -0.2804
+
