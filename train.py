@@ -574,6 +574,91 @@ class Decoder(torch.nn.Module):
         return mu_all, sigma_all
 
 
+class DeterministicDecoder(torch.nn.Module):
+    """
+    Autoregressive LSTM decoder that outputs only point forecasts (mu).
+
+    Identical to Decoder but the output head produces num_targets values
+    instead of num_targets * 2 (no sigma). forward() returns (mu, None)
+    so the 2-element tuple signature is preserved for compatibility with
+    train_one_epoch / validate.
+    """
+    def __init__(self, hidden_size, num_layers, target_days, num_targets,
+                 num_input_features=NUM_TARGET_FEATURES, dropout=0.2):
+        super().__init__()
+        self.target_days = target_days
+        self.num_targets = num_targets
+
+        self.start_embedding = torch.nn.Parameter(
+            torch.zeros(1, 1, num_input_features)
+        )
+        self.input_proj  = torch.nn.Linear(num_input_features, hidden_size)
+        self.lstm        = torch.nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.output_head = torch.nn.Linear(hidden_size, num_targets)
+
+    def forward(self, h, c, targets=None, teacher_forcing_ratio=0.5):
+        """
+        Returns:
+            mu:    (batch, target_days, num_targets)
+            None:  placeholder for sigma (deterministic model has no uncertainty)
+        """
+        batch_size = h.shape[1]
+        all_mu = []
+
+        current_input = self.start_embedding.expand(batch_size, 1, -1)
+
+        for step in range(self.target_days):
+            step_input       = self.input_proj(current_input)
+            out, (h, c)      = self.lstm(step_input, (h, c))
+            out_flat         = out.squeeze(1)
+
+            mu = self.output_head(out_flat)                      # (batch, num_targets)
+            all_mu.append(mu)
+
+            if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                next_input = targets[:, step, :]
+            else:
+                next_input = mu.detach()
+            current_input = next_input.unsqueeze(1)
+
+        mu_all = torch.stack(all_mu, dim=1)   # (batch, target_days, num_targets)
+        return mu_all, None
+
+
+class DeterministicForecaster(torch.nn.Module):
+    """
+    Encoder-decoder model that outputs only point forecasts (no uncertainty).
+
+    Uses the same Encoder as ProbabilisticForecaster but a DeterministicDecoder
+    that produces only mu. Serves as a baseline to quantify the value of
+    learned uncertainty estimates.
+    """
+    def __init__(
+        self,
+        num_features=NUM_FEATURES,
+        hidden_size=128,
+        num_layers=2,
+        target_days=TARGET_DAYS,
+        num_targets=NUM_TARGET_FEATURES,
+        dropout=0.3,
+    ):
+        super().__init__()
+        self.encoder = Encoder(num_features, hidden_size, num_layers, dropout)
+        self.decoder = DeterministicDecoder(hidden_size, num_layers, target_days, num_targets, dropout=dropout)
+
+    def forward(self, x, targets=None, teacher_forcing_ratio=0.5):
+        h, c = self.encoder(x)
+        mu, _ = self.decoder(h, c, targets=targets,
+                             teacher_forcing_ratio=teacher_forcing_ratio)
+        return mu, None
+
+
 class ProbabilisticForecaster(torch.nn.Module):
     """
     Full encoder-decoder model for probabilistic multi-step weather forecasting.
@@ -635,6 +720,11 @@ def mse_loss_mu(mu, target):
     return torch.mean((mu - target) ** 2)
 
 
+def mae_loss(mu, target):
+    """MAE loss — equivalent to CRPS for deterministic (point) forecasts."""
+    return torch.mean(torch.abs(mu - target))
+
+
 def beta_nll_loss(mu, sigma, target, beta=0.5):
     """
     Beta-NLL loss (Seitzer et al. 2022).
@@ -677,8 +767,8 @@ def crps_gaussian_loss(mu, sigma, y):
 
 
 def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5, phase=2,
-                    phase2_loss='crps'):
-    """phase=1: MSE on mu only  |  phase=2: crps or nll (beta-NLL)"""
+                    phase2_loss='crps', deterministic=False):
+    """phase=1: MSE on mu only  |  phase=2: crps or nll (beta-NLL) or mae (deterministic)"""
     model.train()
     total_loss = 0.0
 
@@ -690,6 +780,8 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5,
         mu, sigma = model(x, targets=y, teacher_forcing_ratio=teacher_forcing_ratio)
         if phase == 1:
             loss = mse_loss_mu(mu, y)
+        elif deterministic:
+            loss = mae_loss(mu, y)
         elif phase2_loss == 'crps':
             loss = crps_gaussian_loss(mu, sigma, y)
         else:
@@ -703,15 +795,16 @@ def train_one_epoch(model, loader, optimiser, device, teacher_forcing_ratio=0.5,
     return total_loss / len(loader)
 
 
-def validate(model, loader, device, metric='crps'):
+def validate(model, loader, device, metric='crps', deterministic=False):
     """
     Evaluate the model on a validation or test DataLoader.
 
     Args:
-        model:   ProbabilisticForecaster
+        model:   ProbabilisticForecaster or DeterministicForecaster
         loader:  DataLoader (val or test)
         device:  torch.device
         metric:  'crps' (default) or 'nll' — which loss to return
+        deterministic: if True, use MAE (= point-forecast CRPS)
 
     Returns:
         Mean loss over all batches.
@@ -725,7 +818,9 @@ def validate(model, loader, device, metric='crps'):
             y = y.to(device)
 
             mu, sigma = model(x)
-            if metric == 'crps':
+            if deterministic:
+                total_loss += mae_loss(mu, y).item()
+            elif metric == 'crps':
                 total_loss += crps_gaussian_loss(mu, sigma, y).item()
             else:
                 total_loss += beta_nll_loss(mu, sigma, y).item()
@@ -734,7 +829,8 @@ def validate(model, loader, device, metric='crps'):
 
 
 def train(model, train_loader, val_loader, device, weights_path,
-          n_epochs=EPOCHS, pretrain_epochs=PRETRAIN_EPOCHS, phase2_loss='crps'):
+          n_epochs=EPOCHS, pretrain_epochs=PRETRAIN_EPOCHS, phase2_loss='crps',
+          deterministic=False):
     """
     Two-phase training loop with CRPS-based early stopping.
 
@@ -746,20 +842,23 @@ def train(model, train_loader, val_loader, device, weights_path,
     Phase 2 — CRPS training (up to n_epochs, early stopping on val CRPS):
         Trains on crps_gaussian_loss. Teacher forcing decays linearly
         1.0 → 0.0. Best checkpoint selected by validation CRPS.
+        For deterministic models, phase 2 uses MAE (= point-forecast CRPS).
 
     Args:
-        model:           ProbabilisticForecaster
+        model:           ProbabilisticForecaster or DeterministicForecaster
         train_loader:    training DataLoader
         val_loader:      validation DataLoader
         device:          torch.device
         weights_path:    path to save best model .pt file
         n_epochs:        max phase-2 epochs (default: EPOCHS)
         pretrain_epochs: phase-1 MSE epochs (default: PRETRAIN_EPOCHS)
+        deterministic:   if True, use MAE loss in phase 2 (default: False)
 
     Returns:
         history: dict with keys "phase1_train_mse", "train_loss", "val_crps"
     """
     PATIENCE = 15
+    loss_label = "MAE" if deterministic else phase2_loss.upper()
 
     optimiser = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -787,7 +886,7 @@ def train(model, train_loader, val_loader, device, weights_path,
     epochs_without_improvement = 0
     val_metric = 'crps' if phase2_loss == 'crps' else 'nll'
 
-    print(f"\n[TRAIN] Phase 2: {phase2_loss.upper()} training for up to {n_epochs} epochs "
+    print(f"\n[TRAIN] Phase 2: {loss_label} training for up to {n_epochs} epochs "
           f"(early stopping patience={PATIENCE})")
     print(f"[TRAIN] Best weights will be saved to: {weights_path}\n")
 
@@ -795,8 +894,10 @@ def train(model, train_loader, val_loader, device, weights_path,
         tf_ratio   = max(0.0, 1.0 - (epoch - 1) / n_epochs)
         train_loss = train_one_epoch(model, train_loader, optimiser, device,
                                      teacher_forcing_ratio=tf_ratio, phase=2,
-                                     phase2_loss=phase2_loss)
-        val_loss   = validate(model, val_loader, device, metric=val_metric)
+                                     phase2_loss=phase2_loss,
+                                     deterministic=deterministic)
+        val_loss   = validate(model, val_loader, device, metric=val_metric,
+                              deterministic=deterministic)
 
         scheduler.step(val_loss)
 
@@ -815,8 +916,8 @@ def train(model, train_loader, val_loader, device, weights_path,
 
         print(
             f"Epoch {epoch:03d}/{n_epochs} | "
-            f"Train {phase2_loss.upper()}: {train_loss:.4f} | "
-            f"Val {phase2_loss.upper()}: {val_loss:.4f} | "
+            f"Train {loss_label}: {train_loss:.4f} | "
+            f"Val {loss_label}: {val_loss:.4f} | "
             f"TF: {tf_ratio:.2f}"
             f"{marker}"
         )
@@ -826,7 +927,7 @@ def train(model, train_loader, val_loader, device, weights_path,
                   f"(no improvement for {PATIENCE} epochs)")
             break
 
-    print(f"\n[TRAIN] Done. Best val {phase2_loss.upper()}: {best_val:.4f} — weights saved to {weights_path}")
+    print(f"\n[TRAIN] Done. Best val {loss_label}: {best_val:.4f} — weights saved to {weights_path}")
     return history
 
 
@@ -860,11 +961,12 @@ _ABLATION_NORMAL = {
 }
 
 ABLATION_CONFIGS = [
-    {**_ABLATION_NORMAL, "name": "1-layer",    "filename": "best_weights_single_layer.pt",  "num_layers":      1},
-    {**_ABLATION_NORMAL, "name": "hidden-64",  "filename": "best_weights_hidden64.pt",       "hidden_size":     64},
-    {**_ABLATION_NORMAL, "name": "nll-loss",   "filename": "best_weights_nll_loss.pt",       "phase2_loss":     "nll"},
-    {**_ABLATION_NORMAL, "name": "1-phase",    "filename": "best_weights_single_phase.pt",   "pretrain_epochs": 0},
-    {**_ABLATION_NORMAL, "name": "no-dropout", "filename": "best_weights_no_dropout.pt",     "dropout":         0.0},
+    {**_ABLATION_NORMAL, "name": "1-layer",       "filename": "best_weights_single_layer.pt",  "num_layers":      1},
+    {**_ABLATION_NORMAL, "name": "hidden-64",     "filename": "best_weights_hidden64.pt",       "hidden_size":     64},
+    {**_ABLATION_NORMAL, "name": "nll-loss",      "filename": "best_weights_nll_loss.pt",       "phase2_loss":     "nll"},
+    {**_ABLATION_NORMAL, "name": "1-phase",       "filename": "best_weights_single_phase.pt",   "pretrain_epochs": 0},
+    {**_ABLATION_NORMAL, "name": "no-dropout",    "filename": "best_weights_no_dropout.pt",     "dropout":         0.0},
+    {**_ABLATION_NORMAL, "name": "deterministic", "filename": "best_weights_deterministic.pt",  "deterministic":   True},
 ]
 
 ABLATIONS_DIR = os.path.join(MODELS_DIR, "ablations")
@@ -885,7 +987,9 @@ def run_ablations(train_loader, val_loader):
     for cfg in ABLATION_CONFIGS:
         set_seed()
 
-        model = ProbabilisticForecaster(
+        is_det = cfg.get("deterministic", False)
+        ModelClass = DeterministicForecaster if is_det else ProbabilisticForecaster
+        model = ModelClass(
             hidden_size=cfg["hidden_size"],
             num_layers=cfg["num_layers"],
             dropout=cfg["dropout"],
@@ -895,10 +999,11 @@ def run_ablations(train_loader, val_loader):
         weights_path = os.path.join(ABLATIONS_DIR, cfg["filename"])
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        loss_label = "mae (det)" if is_det else cfg["phase2_loss"]
         print(f"\n{'='*60}")
         print(f"  Ablation: {cfg['name']}  ({num_params:,} params)")
         print(f"  layers={cfg['num_layers']}  hidden={cfg['hidden_size']}  "
-              f"dropout={cfg['dropout']}  loss={cfg['phase2_loss']}  "
+              f"dropout={cfg['dropout']}  loss={loss_label}  "
               f"pretrain={cfg['pretrain_epochs']} epochs")
         print(f"{'='*60}")
 
@@ -907,6 +1012,7 @@ def run_ablations(train_loader, val_loader):
             n_epochs=EPOCHS,
             pretrain_epochs=cfg["pretrain_epochs"],
             phase2_loss=cfg["phase2_loss"],
+            deterministic=is_det,
         )
 
     print(f"\n[ABLATE] All weights saved under {ABLATIONS_DIR}/")

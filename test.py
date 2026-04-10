@@ -1758,6 +1758,7 @@ def ablation_test():
     from train import (
         ABLATION_CONFIGS,
         ABLATIONS_DIR,
+        DeterministicForecaster,
         ProbabilisticForecaster,
         TARGET_FEATURE_INDICES,
         WeatherWindowDataset,
@@ -1811,7 +1812,9 @@ def ablation_test():
             print(f"  [SKIP] {cfg['name']} — weights not found at {weights_path}")
             continue
 
-        model = ProbabilisticForecaster(
+        is_det = cfg.get("deterministic", False)
+        ModelClass = DeterministicForecaster if is_det else ProbabilisticForecaster
+        model = ModelClass(
             hidden_size=cfg["hidden_size"],
             num_layers=cfg["num_layers"],
             dropout=cfg["dropout"],
@@ -1825,40 +1828,64 @@ def ablation_test():
             for x, y in test_loader:
                 mu, sigma = model(x.to(device))
                 all_mu.append(mu.cpu())
-                all_sigma.append(sigma.cpu())
+                if sigma is not None:
+                    all_sigma.append(sigma.cpu())
                 all_y.append(y.cpu())
 
-        mu_norm    = torch.cat(all_mu,    dim=0)
-        sigma_norm = torch.cat(all_sigma, dim=0)
-        y_norm     = torch.cat(all_y,     dim=0)
+        mu_norm = torch.cat(all_mu, dim=0)
+        y_norm  = torch.cat(all_y,  dim=0)
 
         # Denormalise and remap to eval variable order
         t_mean  = train_mean[TARGET_FEATURE_INDICES]
         t_std   = train_std[TARGET_FEATURE_INDICES]
-        mu_r    = (mu_norm    * t_std + t_mean).numpy()[..., MODEL_TO_EVAL]
-        sigma_r = (sigma_norm * t_std          ).numpy()[..., MODEL_TO_EVAL]
-        y_r     = (y_norm     * t_std + t_mean).numpy()[..., MODEL_TO_EVAL]
-
+        mu_r    = (mu_norm * t_std + t_mean).numpy()[..., MODEL_TO_EVAL]
+        y_r     = (y_norm  * t_std + t_mean).numpy()[..., MODEL_TO_EVAL]
         mu_t    = torch.from_numpy(mu_r)
-        sigma_t = torch.from_numpy(sigma_r)
         y_t     = torch.from_numpy(y_r)
 
-        test_crps    = crps_gaussian(mu_t, sigma_t, y_t).item()
-        test_nll     = gaussian_nll(mu_t, sigma_t, y_t).item()
-        cov          = empirical_coverage(mu_t, sigma_t, y_t, [0.5, 0.9])
-        overall_crpss = crps_skill_score(mu_t, sigma_t, y_t, clim_mu, clim_sigma).item()
-        crps_per_var = [
-            float(crps_gaussian(mu_t[..., i:i+1], sigma_t[..., i:i+1], y_t[..., i:i+1]))
-            for i in range(mu_t.shape[-1])
-        ]
-        crpss_per_var = [
-            crps_skill_score(mu_t[..., i:i+1], sigma_t[..., i:i+1], y_t[..., i:i+1],
-                             clim_mu[..., i:i+1], clim_sigma[..., i:i+1]).item()
-            for i in range(mu_t.shape[-1])
-        ]
+        if is_det:
+            # CRPS for point forecasts = MAE
+            test_crps = torch.mean(torch.abs(mu_t - y_t)).item()
+            test_nll  = float('nan')
+            cov       = {0.5: float('nan'), 0.9: float('nan')}
+            # CRPSS: compare point-forecast CRPS (MAE) against Gaussian climatology CRPS
+            clim_crps_val = crps_gaussian(
+                clim_mu.expand_as(mu_t), clim_sigma.expand_as(mu_t), y_t
+            ).item()
+            overall_crpss = 1.0 - test_crps / clim_crps_val
+            crps_per_var = [
+                float(torch.mean(torch.abs(mu_t[..., i] - y_t[..., i])))
+                for i in range(mu_t.shape[-1])
+            ]
+            crpss_per_var = [
+                1.0 - crps_per_var[i] / crps_gaussian(
+                    clim_mu[..., i:i+1].expand_as(mu_t[..., i:i+1]),
+                    clim_sigma[..., i:i+1].expand_as(mu_t[..., i:i+1]),
+                    y_t[..., i:i+1]).item()
+                for i in range(mu_t.shape[-1])
+            ]
+        else:
+            sigma_norm = torch.cat(all_sigma, dim=0)
+            sigma_r    = (sigma_norm * t_std).numpy()[..., MODEL_TO_EVAL]
+            sigma_t    = torch.from_numpy(sigma_r)
+
+            test_crps     = crps_gaussian(mu_t, sigma_t, y_t).item()
+            test_nll      = gaussian_nll(mu_t, sigma_t, y_t).item()
+            cov           = empirical_coverage(mu_t, sigma_t, y_t, [0.5, 0.9])
+            overall_crpss = crps_skill_score(mu_t, sigma_t, y_t, clim_mu, clim_sigma).item()
+            crps_per_var  = [
+                float(crps_gaussian(mu_t[..., i:i+1], sigma_t[..., i:i+1], y_t[..., i:i+1]))
+                for i in range(mu_t.shape[-1])
+            ]
+            crpss_per_var = [
+                crps_skill_score(mu_t[..., i:i+1], sigma_t[..., i:i+1], y_t[..., i:i+1],
+                                 clim_mu[..., i:i+1], clim_sigma[..., i:i+1]).item()
+                for i in range(mu_t.shape[-1])
+            ]
 
         results.append({
             "name":          cfg["name"],
+            "deterministic": is_det,
             "test_crps":     test_crps,
             "overall_crpss": overall_crpss,
             "test_nll":      test_nll,
@@ -1882,22 +1909,35 @@ def ablation_test():
         "Overall CRPSS: skill vs climatology (0=no better than always predicting training mean, 1=perfect)",
         f"Per-variable CRPS units: " + "  ".join(f"{v}={u}" for v, u in zip(var_short, var_units)),
         "Per-variable CRPSS: dimensionless — comparable across variables",
+        "Deterministic baseline: CRPS = MAE (point-forecast CRPS); NLL and coverage are N/A",
         "",
         header, sep,
     ]
     for r in results:
         crps_cols  = "".join(f"  {v:>10.4f}" for v in r["crps_per_var"])
         crpss_cols = "".join(f"  {v:>11.4f}" for v in r["crpss_per_var"])
-        lines.append(
-            f"{r['name']:<14} "
-            f"{r['test_crps']:>7.4f} "
-            f"{r['overall_crpss']:>7.4f} "
-            f"{r['test_nll']:>7.4f} "
-            f"{r['cov_50']*100:>7.1f}% "
-            f"{r['cov_90']*100:>7.1f}%"
-            f"{crps_cols}"
-            f"{crpss_cols}"
-        )
+        if r.get("deterministic", False):
+            lines.append(
+                f"{r['name']:<14} "
+                f"{r['test_crps']:>7.4f} "
+                f"{r['overall_crpss']:>7.4f} "
+                f"{'N/A':>7} "
+                f"{'N/A':>8} "
+                f"{'N/A':>8}"
+                f"{crps_cols}"
+                f"{crpss_cols}"
+            )
+        else:
+            lines.append(
+                f"{r['name']:<14} "
+                f"{r['test_crps']:>7.4f} "
+                f"{r['overall_crpss']:>7.4f} "
+                f"{r['test_nll']:>7.4f} "
+                f"{r['cov_50']*100:>7.1f}% "
+                f"{r['cov_90']*100:>7.1f}%"
+                f"{crps_cols}"
+                f"{crpss_cols}"
+            )
     lines.append(sep)
 
     print("\n" + "\n".join(lines))
@@ -1912,10 +1952,6 @@ def ablation_test():
 if __name__ == '__main__':
     real_data_test()
     ablation_test()
-
-
-
-
 
 
 
