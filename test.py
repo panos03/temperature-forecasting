@@ -42,7 +42,6 @@ Variable order (axis 2):
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import sys
@@ -856,58 +855,6 @@ def run_evaluation(y_true: np.ndarray,
     print(f"\n[EVALUATION] Done. All outputs in {output_dir}/")
 
 
-# =============================================================================
-# Synthetic-data demo
-# =============================================================================
-
-def _generate_synthetic_demo(n_samples: int = 600, seed: int = 42):
-    """
-    Build a fake (y_true, mu_pred, sigma_pred, last_observed) demo that
-    mimics Brazilian-coffee-belt-style daily weather statistics. Used by the
-    __main__ block so the script can be run end-to-end with no real model.
-    """
-    rng = np.random.default_rng(seed)
-    n_total = n_samples + NUM_HORIZONS
-
-    t = np.arange(n_total)
-    season = np.sin(2 * np.pi * (t % 365) / 365.0)
-
-    temp = 22.0 + 5.0 * season + rng.normal(0, 1.5, n_total)
-    humid = 72.0 + 8.0 * season + rng.normal(0, 4.0, n_total)
-    humid = np.clip(humid, 0.0, 100.0)
-    wind = 3.0 + 0.5 * season + rng.normal(0, 0.6, n_total)
-    wind = np.maximum(wind, 0.0)
-    wet = rng.uniform(0, 1, n_total) < (0.35 + 0.15 * season)
-    rain = np.where(wet, rng.gamma(shape=1.5, scale=4.0, size=n_total), 0.0)
-
-    series = np.stack([temp, rain, humid, wind], axis=1)   # (n_total, 4)
-
-    # Sliding window: y_true[i] = series[i+1 .. i+1+H]
-    y_true = np.zeros((n_samples, NUM_HORIZONS, NUM_VARS), dtype=np.float32)
-    for i in range(n_samples):
-        y_true[i] = series[i + 1: i + 1 + NUM_HORIZONS]
-    last_observed = series[:n_samples].astype(np.float32)
-
-    # Synthetic predictions: bias + horizon-growing noise + horizon-growing sigma.
-    h = HORIZONS.reshape(1, NUM_HORIZONS, 1).astype(np.float32)
-    sigma_floor = np.array([1.2, 3.0, 4.5, 0.7],
-                           dtype=np.float32).reshape(1, 1, NUM_VARS)
-    sigma_pred = sigma_floor * (1.0 + 0.25 * h)
-    sigma_pred = np.broadcast_to(sigma_pred, y_true.shape).astype(np.float32).copy()
-
-    bias = np.array([0.3, 0.7, -1.2, 0.1],
-                    dtype=np.float32).reshape(1, 1, NUM_VARS)
-    noise = rng.normal(0, 1, y_true.shape).astype(np.float32) * sigma_pred * 0.85
-    mu_pred = (y_true + noise + bias).astype(np.float32)
-
-    # Physical constraints on the predicted means.
-    mu_pred[..., RAIN_IDX] = np.maximum(mu_pred[..., RAIN_IDX], 0.0)
-    mu_pred[..., HUMID_IDX] = np.clip(mu_pred[..., HUMID_IDX], 0.0, 100.0)
-    mu_pred[..., WIND_IDX] = np.maximum(mu_pred[..., WIND_IDX], 0.0)
-
-    return y_true.astype(np.float32), mu_pred, sigma_pred, last_observed
-
-
 # ---------------------------------------------------------------------------
 # Gaussian Negative Log Likelihood (NLL)
 # ---------------------------------------------------------------------------
@@ -1602,36 +1549,6 @@ def evaluate_and_plot(mu: torch.Tensor, sigma: torch.Tensor, y: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Dummy-data smoke test — no real data required
-# ---------------------------------------------------------------------------
-
-def dummy_data_test():
-    """Smoke test using randomly generated tensors."""
-    _require_torch()
-    B, H, V = 32, 7, 4
-    mu    = torch.randn(B, H, V)
-    sigma = torch.rand(B, H, V) + 0.1
-    y     = torch.randn(B, H, V)
-
-    evaluate_and_plot(mu, sigma, y,
-                      mu.numpy(), sigma.numpy(), y.numpy(),
-                      var_names=TARGET_VAR_NAMES, label='dummy')
-    print("\nDummy data test complete.")
-
-
-def synthetic_evaluation_demo():
-    """Run the standalone numpy evaluation suite with synthetic demo data."""
-    y_true, mu_pred, sigma_pred, last_obs = _generate_synthetic_demo()
-    run_evaluation(
-        y_true=y_true,
-        mu_pred=mu_pred,
-        sigma_pred=sigma_pred,
-        last_observed=last_obs,
-        output_dir=DEFAULT_OUTPUT_DIR,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Real-data evaluation — loads model saved by train.py, no training here
 # ---------------------------------------------------------------------------
 
@@ -1651,8 +1568,6 @@ def real_data_test(output_dir: str = DEFAULT_OUTPUT_DIR):
     """
     _require_torch()
     from train import (
-        FEATURE_COLUMNS,
-        INPUT_DAYS,
         ProbabilisticForecaster,
         TARGET_FEATURE_INDICES,
         WeatherWindowDataset,
@@ -1790,7 +1705,6 @@ def ablation_test():
         TARGET_FEATURE_INDICES,
         WeatherWindowDataset,
         load_daily_data,
-        split_and_normalise,
     )
 
     stats_path  = os.path.join(MODELS_DIR, "normalisation_stats.pt")
@@ -1903,33 +1817,9 @@ def ablation_test():
     print(f"\nAblation summary saved -> {summary_path}")
 
 
-def main():
-    """CLI entrypoint for merged evaluation workflows."""
-    parser = argparse.ArgumentParser(description="Run merged forecast evaluation workflows.")
-    parser.add_argument(
-        "--mode",
-        choices=["real", "dummy", "synthetic-eval", "ablation", "all"],
-        default="real",
-        help="Which evaluation flow to run.",
-    )
-    args = parser.parse_args()
-
-    if args.mode == "dummy":
-        dummy_data_test()
-    elif args.mode == "synthetic-eval":
-        synthetic_evaluation_demo()
-    elif args.mode == "ablation":
-        ablation_test()
-    elif args.mode == "all":
-        synthetic_evaluation_demo()
-        dummy_data_test()
-        real_data_test()
-    else:
-        real_data_test()
-
-
 if __name__ == '__main__':
-    main()
+    real_data_test()
+    ablation_test()
 
 
 
