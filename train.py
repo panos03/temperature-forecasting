@@ -925,24 +925,7 @@ def train(model, train_loader, val_loader, device, weights_path,
 
 
 # =============================================================================
-# SECTION 7: EVALUATION
-# =============================================================================
-
-# TODO: Implement evaluation metrics here.
-#
-# Metrics to compute on the test set:
-#   - CRPS (Continuous Ranked Probability Score): standard for probabilistic forecasts
-#   - Calibration: does the model's 90% interval contain the truth ~90% of the time?
-#   - Sharpness: how tight are the predicted intervals?
-#   - MSE/MAE of the mean predictions (for comparison with baselines)
-#
-# Baselines to compare against:
-#   - Persistence: predict tomorrow = today
-#   - Climatological average: predict the historical mean for that day of year
-
-
-# =============================================================================
-# SECTION 8: ABLATION STUDY
+# SECTION 7: ABLATION STUDY
 # =============================================================================
 
 _ABLATION_NORMAL = {
@@ -1012,7 +995,7 @@ def run_ablations(train_loader, val_loader):
 
 
 # =============================================================================
-# SECTION 9: MAIN
+# SECTION 8: MAIN
 # =============================================================================
 
 def main(max_records=None, n_epochs=EPOCHS):
