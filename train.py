@@ -852,7 +852,6 @@ def train(model, train_loader, val_loader, device, weights_path,
 # =============================================================================
 
 _ABLATION_NORMAL = {
-    "name":            "normal",
     "num_layers":      2,
     "hidden_size":     128,
     "dropout":         0.3,
@@ -861,12 +860,11 @@ _ABLATION_NORMAL = {
 }
 
 ABLATION_CONFIGS = [
-    _ABLATION_NORMAL,
-    {**_ABLATION_NORMAL, "name": "1-layer",    "num_layers":      1},
-    {**_ABLATION_NORMAL, "name": "hidden-64",  "hidden_size":     64},
-    {**_ABLATION_NORMAL, "name": "nll-loss",   "phase2_loss":     "nll"},
-    {**_ABLATION_NORMAL, "name": "1-phase",    "pretrain_epochs": 0},
-    {**_ABLATION_NORMAL, "name": "no-dropout", "dropout":         0.0},
+    {**_ABLATION_NORMAL, "name": "1-layer",    "filename": "best_weights_single_layer.pt",  "num_layers":      1},
+    {**_ABLATION_NORMAL, "name": "hidden-64",  "filename": "best_weights_hidden64.pt",       "hidden_size":     64},
+    {**_ABLATION_NORMAL, "name": "nll-loss",   "filename": "best_weights_nll_loss.pt",       "phase2_loss":     "nll"},
+    {**_ABLATION_NORMAL, "name": "1-phase",    "filename": "best_weights_single_phase.pt",   "pretrain_epochs": 0},
+    {**_ABLATION_NORMAL, "name": "no-dropout", "filename": "best_weights_no_dropout.pt",     "dropout":         0.0},
 ]
 
 ABLATIONS_DIR = os.path.join(MODELS_DIR, "ablations")
@@ -875,12 +873,14 @@ ABLATIONS_DIR = os.path.join(MODELS_DIR, "ablations")
 def run_ablations(train_loader, val_loader):
     """
     Train each config in ABLATION_CONFIGS and save weights to
-    models/ablations/<name>/best_model.pt. No evaluation is done here —
-    run test.py --mode ablation to evaluate the saved checkpoints.
+    models/ablations/<filename>. The normal model is not retrained here —
+    its weights already exist at models/best_model.pt from main().
+    Run test.py to evaluate all checkpoints.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(ABLATIONS_DIR, exist_ok=True)
     print(f"\n[ABLATE] Device: {device}")
-    print(f"[ABLATE] Training {len(ABLATION_CONFIGS)} configurations\n")
+    print(f"[ABLATE] Training {len(ABLATION_CONFIGS)} ablation configurations\n")
 
     for cfg in ABLATION_CONFIGS:
         set_seed()
@@ -892,9 +892,7 @@ def run_ablations(train_loader, val_loader):
         )
         model.to(device)
 
-        cfg_dir      = os.path.join(ABLATIONS_DIR, cfg["name"])
-        os.makedirs(cfg_dir, exist_ok=True)
-        weights_path = os.path.join(cfg_dir, "best_model.pt")
+        weights_path = os.path.join(ABLATIONS_DIR, cfg["filename"])
 
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"\n{'='*60}")

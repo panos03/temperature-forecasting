@@ -1743,7 +1743,7 @@ def ablation_test():
 
     results = []
     for cfg in ABLATION_CONFIGS:
-        weights_path = os.path.join(ABLATIONS_DIR, cfg["name"], "best_model.pt")
+        weights_path = os.path.join(ABLATIONS_DIR, cfg["filename"])
         if not os.path.exists(weights_path):
             print(f"  [SKIP] {cfg['name']} — weights not found at {weights_path}")
             continue
@@ -1797,14 +1797,12 @@ def ablation_test():
     sep    = "-" * len(header)
     lines  = ["ABLATION RESULTS", header, sep]
     for r in results:
-        marker = " <-- normal model" if r["name"] == "normal" else ""
         lines.append(
             f"{r['name']:<14} "
             f"{r['test_crps']:>7.4f} "
             f"{r['test_nll']:>7.4f} "
             f"{r['cov_50']*100:>7.1f}% "
             f"{r['cov_90']*100:>7.1f}%"
-            f"{marker}"
         )
     lines.append(sep)
 
