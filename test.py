@@ -1,44 +1,15 @@
 """
-evaluation.py - Comprehensive evaluation suite for the multi-horizon
-probabilistic weather forecasting system (7-day ahead, 4 variables) used
-for coffee-belt agricultural planning in Minas Gerais, Brazil.
+test.py — Evaluation suite for the 7-day ahead probabilistic weather forecasting system
+(4 variables: temperature, rainfall, humidity, wind speed) for Minas Gerais, Brazil.
 
-The script is intentionally standalone: it consumes plain numpy arrays of
-predictions and ground truth, so it can be wired up to any model that emits
-Gaussian (mu, sigma) heads. All outputs land in `results/`:
-
-    PNGs (each saved at 300 dpi)
-        01_pit_histograms.png            - PIT calibration check, 4 panels
-        02_reliability_diagrams.png      - quantile reliability, 4 panels
-        03_crps_by_horizon.png           - mean CRPS per horizon vs climatology
-        04_sigma_vs_rmse_by_horizon.png  - uncertainty vs realised error, 4 panels
-        05_fan_chart_<var>.png           - 4 fan charts (one per variable)
-        06_scatter_mu_vs_observed.png    - point-forecast accuracy scatter
-        07_rainfall_threshold_exceedance.png  - heavy-rain probability reliability
-        08_frost_risk.png                - frost-probability reliability
-        09_calibration.png              - reliability diagram (single-variable PIL)
-        10_forecast.png                 - 7-day forecast vs observations (PIL)
-
-    CSVs
-        table_point_metrics.csv          - MAE/RMSE per (variable, horizon)
-                                            with persistence + climatology baselines
-        table_interval_coverage.csv      - 50/80/95% PI coverage with deviation flags
-
-Each metric/plot includes a docstring explaining what it measures and how
-to interpret it. Run `python evaluation.py` directly for an end-to-end
-synthetic demo with no real model required.
-
-Expected array shapes:
-    y_true:     (n_samples, 7, 4)   ground truth in real-world units
-    mu_pred:    (n_samples, 7, 4)   predicted Gaussian means
-    sigma_pred: (n_samples, 7, 4)   predicted Gaussian standard deviations
-
-Variable order (axis 2):
-    0 - Temperature (deg C)
-    1 - Rainfall (mm)
-    2 - Humidity (%)
-    3 - Wind Speed (m/s)
+Loads saved weights from models/, runs inference on the held-out test set, and writes
+all metrics and plots to results/.
 """
+
+# GenAI Usage: Claude was used in an assistive role during development of this file.
+# Specifically, for overall code structure, docstring formatting, and graph plotting
+# code. All evaluation logic, metric implementations, and visualisation choices were
+# brainstormed and verified by the group.
 
 from __future__ import annotations
 
@@ -69,19 +40,15 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-# Optional seaborn — used purely for the colour-blind theme.
-try:
-    import seaborn as sns
-    sns.set_theme(style="whitegrid", context="paper")
-    _PALETTE = sns.color_palette("colorblind", 4)
-except ImportError:
-    # Wong colour-blind safe palette as fallback
-    _PALETTE = [
-        (0.000, 0.447, 0.741),   # blue
-        (0.835, 0.369, 0.000),   # vermilion
-        (0.000, 0.620, 0.451),   # bluish green
-        (0.800, 0.475, 0.655),   # reddish purple
-    ]
+# Wong colour-blind safe palette
+_PALETTE = [
+    (0.000, 0.447, 0.741),   # blue
+    (0.835, 0.369, 0.000),   # vermilion
+    (0.000, 0.620, 0.451),   # bluish green
+    (0.800, 0.475, 0.655),   # reddish purple
+]
+mpl.rcParams["axes.grid"] = True
+mpl.rcParams["axes.axisbelow"] = True
 
 # Publication-quality matplotlib defaults
 mpl.rcParams.update({

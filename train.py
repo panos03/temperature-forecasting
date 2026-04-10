@@ -1,22 +1,15 @@
 """
 train.py — Probabilistic Multivariate Weather Forecasting for Minas Gerais
-============================================================================
-Full pipeline: data retrieval -> preprocessing -> training -> evaluation.
 
-Environment: comp0197-pt
-    micromamba create --name comp0197-pt python=3.12 -y
-    micromamba activate comp0197-pt
-    pip install torch torchvision pillow --index-url https://download.pytorch.org/whl/cpu
-
-Additional package (only needed if data not already downloaded):
-    pip install cdsapi
-
-Additional package if SSL certificate issues arise:
-    pip install --upgrade certifi
-
-Data: If data/raw/era5_minas_gerais_hourly.csv is already present, the download
-step is skipped entirely and cdsapi is not required.
+Full pipeline: ERA5 data retrieval -> preprocessing -> model training -> saved weights.
+If data/raw/era5_minas_gerais_hourly.csv is already present, the download step is skipped.
+Trained weights are saved to models/.
 """
+
+# GenAI Usage: Claude was used in an assistive role during development of this file.
+# Specifically, for code structure, docstring formatting, and specific methods like the
+# appropriate torch.nn module methods and APIs. Model architecture decisions, training logic,
+# and experimental design were brainstormed and verified by the group.
 
 import os
 import csv
