@@ -486,15 +486,14 @@ class Encoder(torch.nn.Module):
 
 class Decoder(torch.nn.Module):
     """
-    Autoregressive LSTM decoder with a zero-inflated precipitation head.
+    Autoregressive LSTM decoder.
 
     At each step the LSTM input is the previous step's predicted mu values
     (or ground truth during training — teacher forcing).
     Step 0 is seeded with a learned start embedding.
 
     The standard output_head produces (mu, log_sigma) for all 4 target
-    variables. A separate precip_head produces logit(p_rain), the probability
-    of non-zero precipitation, used by the zero-inflated loss.
+    variables.
 
     Args:
         hidden_size:        Must match encoder hidden_size
@@ -662,14 +661,10 @@ class ProbabilisticForecaster(torch.nn.Module):
            (h, c)
               |
         Decoder LSTM  (learned start embedding -> hidden_size)
-              |
+             |
         output_head   (hidden_size -> 4*2)   mu, sigma for all variables
-              |
+             |
         mu, sigma   (batch, 7, 4) / (batch, 7, 4)
-
-    Designed for a T4 GPU on Google Colab:
-        hidden_size=128, num_layers=2 -> ~470k parameters, fits comfortably
-        in 16 GB VRAM with batch_size=64 and sequence length 30+7.
 
     Args:
         num_features:  Total encoder input features (9)
@@ -677,7 +672,7 @@ class ProbabilisticForecaster(torch.nn.Module):
         num_layers:    Stacked LSTM layers in both encoder and decoder (default 2)
         target_days:   Forecast horizon (default 7)
         num_targets:   Variables to predict probabilistically (default 4)
-        dropout:       Regularisation dropout between LSTM layers (default 0.2)
+        dropout:       Regularisation dropout between LSTM layers (default 0.3)
     """
     def __init__(
         self,
@@ -720,7 +715,7 @@ def mae_loss(mu, target):
 
 def beta_nll_loss(mu, sigma, target, beta=0.5):
     """
-    Beta-NLL loss (Seitzer et al. 2022).
+    Beta-NLL loss.
 
     Weights each NLL term by sigma^(2*beta) with a stop-gradient on sigma.
     This breaks the feedback loop where the model lowers sigma to reduce loss
@@ -796,7 +791,7 @@ def validate(model, loader, device, metric='crps', deterministic=False):
         model:   ProbabilisticForecaster or DeterministicForecaster
         loader:  DataLoader (val or test)
         device:  torch.device
-        metric:  'crps' (default) or 'nll' — which loss to return
+        metric:  'crps' (default) or 'nll' — which loss to return (nll computes beta-nll)
         deterministic: if True, use MAE (= point-forecast CRPS)
 
     Returns:
@@ -828,9 +823,7 @@ def train(model, train_loader, val_loader, device, weights_path,
     Two-phase training loop with CRPS-based early stopping.
 
     Phase 1 — MSE pretraining (pretrain_epochs, no early stopping, TF=1.0):
-        Trains mu to convergence before sigma is introduced. Prevents the
-        zero-inflated precipitation BCE component from dominating early
-        training and starving sigma of gradient.
+        Trains mu to convergence before sigma is introduced.
 
     Phase 2 — CRPS training (up to n_epochs, early stopping on val CRPS):
         Trains on crps_gaussian_loss. Teacher forcing decays linearly
